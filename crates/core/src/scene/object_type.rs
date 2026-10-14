@@ -193,6 +193,15 @@ impl ObjectType {
             .filter(|s| s.blocks)
     }
 
+    /// The type's solid shape when it keeps the weather off what is under it.
+    pub fn shelter_shape(&self) -> Option<&crate::camera_arm::BlockerShape> {
+        Some(
+            self.camera
+                .get_or_init(|| crate::camera_arm::classify(self)),
+        )
+            .filter(|s| s.shelters)
+    }
+
     /// (definition, pivot) per loaded mesh, for the scenery script runtime.
     pub fn mesh_defs(&self) -> Vec<(&MeshDef, Mat4)> {
         self.mesh_def_index
@@ -233,6 +242,10 @@ pub struct ScriptedObject {
     pub last_tex_selection: Option<Vec<usize>>,
     /// Dynamic material overrides by (instance, slot) from dynamic_texture_variant.
     pub dynamic_materials: HashMap<(usize, usize), Vec<MaterialId>>,
+    /// Coronas switched by a script variable, and that variable.
+    pub coronas: Vec<(::render::Corona, String)>,
+    /// Current brightness of each corona.
+    pub lit: Vec<f32>,
 }
 
 /// Where a ray lands on a page (`[htmltexture]`) of a scenery object: see

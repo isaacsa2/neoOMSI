@@ -64,10 +64,11 @@ impl Renderer {
                 continue;
             }
             let p = (l.position - ro).as_vec3();
-            let x0 = ((p.x - l.radius - origin[0]) / LIGHT_CELL).floor();
-            let x1 = ((p.x + l.radius - origin[0]) / LIGHT_CELL).floor();
-            let y0 = ((p.y - l.radius - origin[1]) / LIGHT_CELL).floor();
-            let y1 = ((p.y + l.radius - origin[1]) / LIGHT_CELL).floor();
+            let [east, west, north, south] = light_reach(l);
+            let x0 = ((p.x - west - origin[0]) / LIGHT_CELL).floor();
+            let x1 = ((p.x + east - origin[0]) / LIGHT_CELL).floor();
+            let y0 = ((p.y - south - origin[1]) / LIGHT_CELL).floor();
+            let y1 = ((p.y + north - origin[1]) / LIGHT_CELL).floor();
             if x1 < 0.0 || y1 < 0.0 || x0 >= side as f32 || y0 >= side as f32 {
                 continue;
             }
@@ -281,6 +282,28 @@ impl Renderer {
 
     pub fn set_light_map_place(&self, x: f64, y: f64, side: f64) {
         self.lm_place.set((x, y, side));
+    }
+
+    /// The roofs around the camera (`sheltered` in scene_base.wgsl): [`COVER_SIDE`]² cells
+    /// of `cell` m, south-west corner at world (`x`, `y`), each the roof's world height.
+    /// The cells wrap round: the corner cell is in slot `slot` (column, row). `roofs` only
+    /// when they changed.
+    pub fn set_cover_map(
+        &self,
+        x: f64,
+        y: f64,
+        cell: f32,
+        slot: (u32, u32),
+        roofs: Option<&[f32]>,
+    ) {
+        self.cover_place.set(Some((x, y, cell, slot)));
+        if let Some(r) = roofs.filter(|r| r.len() == (COVER_SIDE * COVER_SIDE) as usize) {
+            self.write_buffer(
+                &self.cover_buf,
+                COVER_HEADER as u64 * 4,
+                bytemuck::cast_slice(r),
+            );
+        }
     }
 
     pub fn set_corona_texture(&mut self, id: u16, img: &::texture::Image) {

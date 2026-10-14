@@ -54,6 +54,7 @@ mod sampler;
 mod scene;
 mod schedule;
 mod schedule_paper;
+mod shelter;
 mod showcase;
 mod sound_events;
 mod threads;
@@ -533,6 +534,7 @@ pub(crate) fn make_app(
         ui: ui::Ui::new(),
         fps: 0.0,
         rain: rain::Rain::new(),
+        shelter: shelter::Shelter::new(),
         splashes: puddles::Splashes::new(),
         lamps_on: None,
         menu: None,
@@ -561,6 +563,7 @@ pub(crate) fn make_app(
         vr_cursor_warp_pending: None,
         window_focused: false,
         keys: Default::default(),
+        modifiers: Default::default(),
         door_key_triggers: Default::default(),
         pad_doors: Default::default(),
         last: Instant::now(),

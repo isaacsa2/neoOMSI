@@ -352,6 +352,8 @@ impl World {
                         htmls: Vec::new(),
                         last_tex_selection: None,
                         dynamic_materials: HashMap::new(),
+                        coronas: Vec::new(),
+                        lit: Vec::new(),
                     });
                 }
                 // An editor-only object still lays its paths out: OMSI's invisible
@@ -614,8 +616,9 @@ impl World {
                 }
             }
             // what the outside camera cannot pass through: houses, walls, shelters, canopies
-            // (surface objects too - a petrol station is a drivable [surface] with a roof)
-            if let Some(shape) = ot.camera_shape() {
+            // (surface objects too - a petrol station is a drivable [surface] with a roof),
+            // and the roofs that keep the weather off
+            if let Some(shape) = ot.camera_shape().or_else(|| ot.shelter_shape()) {
                 state.blockers.push(crate::camera_arm::Blocker {
                     ty: Arc::downgrade(&ot),
                     pos,
@@ -645,6 +648,10 @@ impl World {
                     // a traffic lamp's red, yellow and green glow with its state
                     // (`LightObject::coronas`), not all at once by night
                     if lamp.is_some() && matches!(sw, LightSwitch::Variable(_)) {
+                        continue;
+                    }
+                    // nor those the object's script switches (#372)
+                    if sw.script_var(ot.program.as_deref()).is_some() {
                         continue;
                     }
                     state.coronas.push(StaticCorona {
