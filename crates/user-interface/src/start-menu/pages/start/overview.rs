@@ -21,24 +21,9 @@ impl Ui {
         tl.place(scene, x0, ty);
         self.text.rounded(r, scene, [x0, ty + tl.h as f32 + 4.0 * u, x0 + 48.0 * u, ty + tl.h as f32 + 7.0 * u], 0.0, ACCENT);
         let sy = ty + tl.h as f32 + 14.0 * u;
-        let bs = (32.0 * u).round();
-        let csz = (22.0 * u).round();
-        let sub = if v.vehicles > 0 {
-            format!("{}  {} / {}", v.maker, v.vehicle + 1, v.vehicles)
-        } else {
-            "-".to_string()
-        };
+        let sub = if v.vehicles > 0 { v.maker.to_string() } else { "-".to_string() };
         let sl = self.text.label(r, scene, sub.trim(), (17.0 * u) as u32, SOFT);
-        let prev = [x0, sy, x0 + bs, sy + bs];
-        let next = [prev[2] + 12.0 * u + sl.w as f32, sy, prev[2] + 12.0 * u + sl.w as f32 + bs, sy + bs];
-        for (k, (b, name)) in [(prev, "chevron_left"), (next, "chevron_right")].into_iter().enumerate() {
-            let av = self.ease((218, name, 0), if inside(b, f.cursor) { 1.0 } else { 0.0 }, 12.0);
-            if let Some(ic) = self.text.icon(r, scene, name, csz as u32, mix(MUTED, WHITE, av)) {
-                ic.place(scene, b[0] + (bs - csz) * 0.5, b[1] + (bs - csz) * 0.5);
-            }
-            hits.1[k] = b;
-        }
-        sl.place(scene, prev[2] + 6.0 * u, sy + (bs - sl.h as f32) * 0.5);
+        sl.place(scene, x0, sy);
 
         if v.can_continue {
             let cl = self.text.label(r, scene, "start.maps.cont", (16.0 * u) as u32, SOFT);
@@ -56,7 +41,7 @@ impl Ui {
             self.start.cont = rc;
         }
 
-        let (ay0, ay1) = (sy + bs + 16.0 * u, dock[1]);
+        let (ay0, ay1) = (sy + sl.h as f32 + 16.0 * u, dock[1]);
         if v.on_foot {
             self.start_foot_note(r, scene, [card[0], ay0, card[2], ay1], u);
         } else {
@@ -95,20 +80,15 @@ impl Ui {
             let rc = [x, dock[1] + 14.0 * u, x + tw, dock[3] - 14.0 * u];
             let th = rc[3] - rc[1];
             let hot = inside(rc, f.cursor);
-            let on = v.focus == k;
-            let hv = self.ease((220, "sum", k), if hot || on { 1.0 } else { 0.0 }, 10.0);
+            let hv = self.ease((220, "sum", k), if hot { 1.0 } else { 0.0 }, 10.0);
             self.text.rounded(r, scene, rc, ROW_R * u, mix(OPT_ROW, OPT_ROW_HOT, hv));
-            let ov = self.ease((220, "sumon", k), if on { 1.0 } else { 0.0 }, 10.0);
-            if ov > 0.0 {
-                self.accent_bar(r, scene, rc, ov, false, u);
-            }
             let ix = rc[0] + 18.0 * u;
             if let Some(ic) = self.text.icon(r, scene, icon, isz as u32, ACCENT) {
                 ic.place(scene, ix, rc[1] + (th - isz) * 0.5);
             }
             let tx = ix + isz + 16.0 * u;
             let room = rc[2] - tx - 14.0 * u;
-            let cl = self.text.label(r, scene, key, (11.0 * u) as u32, if hot || on { SOFT } else { MUTED });
+            let cl = self.text.label(r, scene, key, (11.0 * u) as u32, if hot { SOFT } else { MUTED });
             let vt = clip_to(&self.text, value, 19.0 * u, room);
             let vl = self.text.label(r, scene, &vt, (19.0 * u) as u32, WHITE);
             let st = clip_to(&self.text, sub, 13.0 * u, room);

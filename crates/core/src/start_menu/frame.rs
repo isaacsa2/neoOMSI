@@ -145,6 +145,7 @@ impl App {
         let rows = m.rows();
         let (time_text, cal_title, cal_cells) = (m.time_text(), m.cal_title(), m.cal_cells());
         let drop_items = if m.drop != 0 { m.drop_items(m.drop) } else { Vec::new() };
+        let drop_dim = m.drop_dim(m.drop);
         let (weather_rows, custom_rows) = (m.weather_rows(), m.custom_rows());
         let icao_rows = m.icao_matches(5);
         let custom_fracs = m.custom_fracs();
@@ -166,6 +167,10 @@ impl App {
         let entry_names: Vec<String> = entry_rows.iter().map(|r| r.1.clone()).collect();
         let entry_sel = entry_rows.iter().position(|r| r.0 == m.entry_shown());
         let route_sub = match m.chosen_tour() {
+            Some((l, t)) if m.route && !m.trip_text().is_empty() => ::i18n::translate(
+                "start.maps.linetourtrip",
+                &[("line", &l.name), ("tour", &t.number), ("trip", &m.trip_text())],
+            ),
             Some((l, t)) if m.route => {
                 ::i18n::translate("start.maps.linetour", &[("line", &l.name), ("tour", &t.number)])
             }
@@ -173,8 +178,19 @@ impl App {
         };
         let (addr_state, addr_note) = probe_text(m.probe_of(&m.address), false);
         let server_state: Vec<(u8, String)> = m.servers.iter().map(|s| probe_text(m.probe_of(&s.1), true)).collect();
+        let profile = profile::load(m.page == StartPage::Profile);
+        let drivers = ui::DriverMenu {
+            open: m.drv_open,
+            names: m.drv_names.clone(),
+            current: m.drv_names.iter().position(|n| n.eq_ignore_ascii_case(&profile.name)),
+            new: m.drv_new.clone(),
+            confirm: m.drv_confirm,
+            note: m.drv_note.clone(),
+        };
         let view = StartView {
             update: &update,
+            profile: &profile,
+            drivers: &drivers,
             page: m.page,
             sel: m.sel,
             can_continue: m.continue_sit.is_some(),
@@ -186,6 +202,7 @@ impl App {
             zone: m.zone,
             address: &m.address,
             addr_sel: m.addr_sel,
+            addr_focus: m.addr_focus,
             caret,
             mp_tab: m.mp_tab,
             host: m.host,
@@ -219,6 +236,7 @@ impl App {
             query: &m.veh_query,
             drop: m.drop,
             drop_items: &drop_items,
+            drop_dim: &drop_dim,
             drop_sel: m.drop_sel(m.drop),
             drop_top: m.drop_top,
             edit: m.edit,
@@ -241,6 +259,7 @@ impl App {
             icao: &m.icao,
             custom_fracs: &custom_fracs,
             icao_rows: &icao_rows,
+            icao_top: m.icao_top,
         };
         let frame = ui::Frame::bare(
             scale,
@@ -311,6 +330,15 @@ impl App {
         let Some(k) = self.menu.as_ref().and_then(|m| m.slider) else {
             return;
         };
+        if k == usize::MAX {
+            let bx = self.ui.as_ref().map_or([0.0; 4], |u| u.start.drop_box);
+            if let Some(m) = self.menu.as_mut().filter(|m| m.drop != 0 && bx[3] > bx[1]) {
+                let max = m.drop_items(m.drop).len().saturating_sub(6);
+                let t = ((cursor.1 - bx[1]) / (bx[3] - bx[1])).clamp(0.0, 1.0);
+                m.drop_top = (t * max as f32).round() as usize;
+            }
+            return;
+        }
         let rc = self.ui.as_ref().and_then(|u| u.start.sliders.get(k).copied());
         if let (Some(rc), Some(m)) = (rc, self.menu.as_mut()) {
             if rc[2] > rc[0] {

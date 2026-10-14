@@ -353,13 +353,13 @@ fn spline_batches_keep_materials_cells_shadows_and_long_segments_separate() {
         (mesh(1.0, 2.0), ty.clone(), false, DVec3::ZERO),
         (mesh(5.0, 2.0), ty.clone(), false, DVec3::ZERO),
         (mesh(9.0, 2.0), compatible, false, DVec3::ZERO),
-        (mesh(49.0, 2.0), ty.clone(), false, DVec3::ZERO),
+        (mesh(SPLINE_CELL + 1.0, 2.0), ty.clone(), false, DVec3::ZERO),
         (mesh(1.0, 2.0), other, false, DVec3::ZERO),
         (mesh(1.0, 2.0), other_dir, false, DVec3::ZERO),
         (mesh(1.0, 2.0), tested, false, DVec3::ZERO),
         (mesh(1.0, 2.0), ty.clone(), true, DVec3::ZERO),
-        (mesh(1.0, 100.0), ty.clone(), false, DVec3::ZERO),
-        (mesh(1.0, 100.0), ty, false, DVec3::ZERO),
+        (mesh(1.0, 2.0 * SPLINE_CELL), ty.clone(), false, DVec3::ZERO),
+        (mesh(1.0, 2.0 * SPLINE_CELL), ty, false, DVec3::ZERO),
         (
             mesh(1.0, 2.0),
             blended.clone(),
@@ -377,6 +377,71 @@ fn spline_batches_keep_materials_cells_shadows_and_long_segments_separate() {
     assert_eq!(batched[0].0.ranges, vec![(0, 9, 0)]);
     assert_eq!(batched.iter().filter(|b| b.2).count(), 1);
     assert_eq!(batched.iter().map(|b| b.0.indices.len()).sum::<usize>(), 36);
+}
+
+#[test]
+fn spline_batches_draw_a_texture_once_per_batch() {
+    use ::scenery::sli::{SplineProfile, SplineProfilePoint, SplineTexture};
+    // a curb, the road, the other curb: three profiles over two textures
+    let profile = |texture: usize, x0: f32, x1: f32| SplineProfile {
+        texture,
+        points: [x0, x1]
+            .map(|x| SplineProfilePoint {
+                x,
+                v_scale: 0.1,
+                ..Default::default()
+            })
+            .to_vec(),
+    };
+    let def = Spline {
+        textures: vec![SplineTexture::default(), SplineTexture::default()],
+        profiles: vec![
+            profile(0, -4.0, -3.5),
+            profile(1, -3.5, 3.5),
+            profile(0, 3.5, 4.0),
+        ],
+        ..Default::default()
+    };
+    let curve = |x: f64| ::geometry::SplineCurve {
+        start: DVec3::new(x, 0.0, 0.0),
+        heading_deg: 0.0,
+        length: 20.0,
+        radius: 0.0,
+        grad_start: 0.0,
+        grad_end: 0.0,
+        delta_h: None,
+        cant_start: 0.0,
+        cant_end: 0.0,
+        skew_start: 0.0,
+        skew_end: 0.0,
+        tex_offset: 0.0,
+        seed: 0,
+        half_cant_width: ::geometry::DEFAULT_HALF_CANT_WIDTH,
+    };
+    let mesh = |x: f64| {
+        Arc::new(::geometry::build_spline_mesh(
+            &def,
+            &curve(x),
+            false,
+            DVec3::ZERO,
+        ))
+    };
+    assert_eq!(mesh(0.0).ranges.len(), 3);
+    let ty = Arc::new(SplineType {
+        def: def.clone(),
+        dir: PathBuf::new(),
+        surface_maps: None,
+    });
+    let batched = batch_static_splines(vec![
+        (mesh(0.0), ty.clone(), false, DVec3::ZERO),
+        (mesh(10.0), ty, false, DVec3::ZERO),
+    ]);
+    assert_eq!(batched.len(), 1);
+    assert_eq!(
+        batched[0].0.ranges.iter().map(|r| r.2).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(batched[0].0.indices.len(), 2 * mesh(0.0).indices.len());
 }
 
 #[test]
@@ -673,6 +738,21 @@ fn lights_of_lower_lods_count() {
         "points down: {:?}",
         coronas[0].direction
     );
+}
+
+/// A light's star (effect bit 1) is three times the glow's size, as in OMSI (#324).
+#[test]
+fn a_light_star_reaches_past_its_glow() {
+    let text = "[mesh]\nsignal.o3d\n[light_enh_2]\n0\n0.136\n0.3\n0\n1\n0\n0\n0\n1\n0\n0\n255\n0\n0\n0.25\n20\n50\n1\n1\n0.1\n1\n0\n0\n";
+    let model = Model::parse(&::legacy_config::CfgFile::from_str("signal.sco", text));
+    let coronas = model_lights_faded(&model, &|_| Mat4::IDENTITY, DVec3::ZERO, &|_| 1.0, &[]);
+    let glow = coronas
+        .iter()
+        .find(|c| !c.halo && c.flags & 8 == 0)
+        .unwrap();
+    let star = coronas.iter().find(|c| c.flags & 8 != 0).unwrap();
+    assert!((glow.size - 0.125).abs() < 1e-6);
+    assert!((star.size - 0.375).abs() < 1e-6);
 }
 
 #[test]

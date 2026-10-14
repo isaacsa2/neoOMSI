@@ -4,6 +4,7 @@ use super::pause_menu::{Metrics, inside, out};
 use super::*;
 
 mod bar;
+mod drivers;
 mod pages;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -11,7 +12,8 @@ pub enum StartPage {
     #[default]
     Start,
     Multiplayer,
-    Options
+    Options,
+    Profile,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -36,6 +38,39 @@ pub struct TourRow {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct DriveRow {
+    pub title: String,
+    pub sub: String,
+    pub secs: i64,
+    pub meters: i64,
+    pub ago: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DriverMenu {
+    pub open: bool,
+    pub names: Vec<String>,
+    pub current: Option<usize>,
+    pub new: Option<String>,
+    pub confirm: Option<usize>,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProfileView {
+    pub name: String,
+    pub level: u32,
+    pub xp_to_next: u32,
+    pub xp_frac: f32,
+    pub secs: i64,
+    pub meters: i64,
+    pub stops: i64,
+    pub on_time: Option<u32>,
+    pub ratings: [Option<u32>; 3],
+    pub drives: Vec<DriveRow>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct StartUpdate {
     pub kind: u8,
     pub label: String,
@@ -44,6 +79,8 @@ pub struct StartUpdate {
 
 pub struct StartView<'a> {
     pub update: &'a StartUpdate,
+    pub profile: &'a ProfileView,
+    pub drivers: &'a DriverMenu,
     pub page: StartPage,
     pub sel: usize,
     pub can_continue: bool,
@@ -55,6 +92,7 @@ pub struct StartView<'a> {
     pub zone: usize,
     pub address: &'a str,
     pub addr_sel: bool,
+    pub addr_focus: bool,
     pub caret: bool,
     pub mp_tab: usize,
     pub host: bool,
@@ -72,6 +110,7 @@ pub struct StartView<'a> {
     pub query: &'a str,
     pub drop: usize,
     pub drop_items: &'a [String],
+    pub drop_dim: &'a [bool],
     pub drop_sel: usize,
     pub drop_top: usize,
     pub edit: u8,
@@ -94,6 +133,7 @@ pub struct StartView<'a> {
     pub icao: &'a str,
     pub custom_fracs: &'a [f32],
     pub icao_rows: &'a [(String, String)],
+    pub icao_top: usize,
     pub free: bool,
     pub on_foot: bool,
     pub lines: &'a [LineRow],
@@ -129,6 +169,17 @@ pub struct StartUi {
     pub sect_tabs: Vec<[f32; 4]>,
     pub close: [f32; 4],
     pub quit: [f32; 4],
+    pub profile_btn: [f32; 4],
+    pub drv_box: [f32; 4],
+    pub drv_btn: [f32; 4],
+    pub drv_open_now: bool,
+    pub drv_items: Vec<[f32; 4]>,
+    pub drv_dels: Vec<[f32; 4]>,
+    pub drv_first: usize,
+    pub drv_new_row: [f32; 4],
+    pub drv_create: [f32; 4],
+    pub driver: String,
+    pub bare: bool,
     pub next: [f32; 4],
     pub cont: [f32; 4],
     pub veh: Vec<[f32; 4]>,
@@ -138,7 +189,14 @@ pub struct StartUi {
     pub drops: Vec<[f32; 4]>,
     pub drop_items: Vec<[f32; 4]>,
     pub drop_box: [f32; 4],
+    /// A dropdown list waiting to be drawn on top of the page: [x0, y, x1, _].
+    pub drop_pending: Option<[f32; 4]>,
     pub drop_first: usize,
+    /// The smoothly scrolled top row of the open dropdown list, and the list it belongs to.
+    pub drop_scroll: f32,
+    /// Height of the page in layout units (the limit of an open dropdown list).
+    pub view_h: f32,
+    pub drop_scroll_for: usize,
     pub details: [f32; 4],
     pub pic_size: (u32, u32),
     pub pic_rect: [f32; 4],
@@ -156,6 +214,7 @@ pub struct StartUi {
     pub foot: [f32; 4],
     pub sliders: Vec<[f32; 4]>,
     pub icao_field: [f32; 4],
+    pub icao_vis: usize,
     pub icao_picks: Vec<[f32; 4]>,
     pub go: [f32; 4],
     pub field: [f32; 4],
@@ -178,6 +237,8 @@ pub struct StartUi {
     pub route_rect: [f32; 4],
     pub route_status: String,
     pub stops: Vec<(String, f32, f32)>,
+    /// The entry points on the map picture (index, x and y as shares of the picture).
+    pub entry_hits: Vec<(u32, f32, f32)>,
     t: f32,
     page_t: f32,
     sect_t: f32,
@@ -194,6 +255,14 @@ impl StartUi {
         self.items.clear();
         self.tabs.clear();
         self.quit = [0.0; 4];
+        self.profile_btn = [0.0; 4];
+        self.drv_box = [0.0; 4];
+        self.drv_btn = [0.0; 4];
+        self.drv_items.clear();
+        self.drv_dels.clear();
+        self.drv_new_row = [0.0; 4];
+        self.drv_create = [0.0; 4];
+        self.bare = false;
         self.maps.clear();
         self.rows.clear();
         self.arrows.clear();
@@ -206,6 +275,7 @@ impl StartUi {
         self.drops.clear();
         self.drop_items.clear();
         self.drop_box = [0.0; 4];
+        self.drop_pending = None;
         self.details = [0.0; 4];
         self.seasons.clear();
         self.close = [0.0; 4];
@@ -262,6 +332,8 @@ impl Ui {
         self.start.t = (self.start.t + self.anim_dt / 0.35).min(1.0);
         self.start.clear();
         self.start.update = v.update.clone();
+        self.start.driver = v.profile.name.clone();
+        self.start.drv_open_now = v.drivers.open;
         let at = |rs: &[[f32; 4]]| rs.iter().any(|rc| inside(*rc, f.cursor));
         match v.page {
             StartPage::Start => {
@@ -291,30 +363,36 @@ impl Ui {
                     || at(&self.start.sliders)
                     || at(&self.start.icao_picks)
                     || at(&[self.start.icao_field, self.start.foot])
-                    || at(&self.start.tabs) || at(&[self.start.go, self.start.quit, self.start.update_btn]);
+                    || at(&self.start.tabs) || at(&[self.start.go, self.start.quit, self.start.update_btn, self.start.profile_btn]);
             }
             StartPage::Multiplayer => {
                 self.draw_start_join(r, scene, f, m, v);
                 self.hand = at(&self.start.mp_tabs)
                     || at(&self.start.servers)
                     || at(&self.start.tabs)
-                    || at(&[self.start.go, self.start.field, self.start.host_row, self.start.quit, self.start.update_btn]);
+                    || at(&[self.start.go, self.start.field, self.start.host_row, self.start.quit, self.start.update_btn, self.start.profile_btn]);
             }
             StartPage::Options => {
                 self.text.rounded(r, scene, [0.0, 0.0, m.w, m.h], 0.0, [10, 12, 16, 255]);
                 self.draw_pause(r, scene, f, PauseState { page: Some(OPTIONS_PAGE), sel: 0 });
-                self.hand |= at(&self.start.tabs) || at(&[self.start.quit]);
+                self.hand |= at(&self.start.tabs) || at(&[self.start.quit, self.start.profile_btn]);
+            }
+            StartPage::Profile => {
+                self.draw_start_profile(r, scene, f, m, v);
+                self.hand = at(&self.start.tabs) || at(&[self.start.quit, self.start.update_btn, self.start.profile_btn]);
             }
         }
+        self.draw_driver_menu(r, scene, f, m, v);
+        self.hand |= at(&self.start.drv_items)
+            || at(&self.start.drv_dels)
+            || at(&[self.start.drv_btn, self.start.drv_new_row, self.start.drv_create]);
         self.start.hand = self.hand;
         self.text.flat = false;
         self.text.end_frame(r, scene);
     }
 }
 
-pub(super) fn head_alpha(pt: f32) -> f32 {
-    out(pt / 0.6)
-}
-
 pub(super) const BG: [u8; 4] = [10, 12, 16, 255];
 pub(super) const ACCENT_TEXT: [u8; 4] = [232, 160, 48, 0];
+/// A dropdown row that is over (a trip already gone): well below `MUTED`.
+pub(super) const GONE: [u8; 4] = [85, 85, 88, 0];

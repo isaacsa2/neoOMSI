@@ -3,7 +3,10 @@ use super::*;
 impl App {
     pub(crate) fn start_text(&mut self, text: &str) {
         let ctrl = self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight);
-        if let Some(m) = self.menu.as_mut().filter(|m| m.page == StartPage::Multiplayer && m.mp_tab == 0 && !ctrl) {
+        if !ctrl && self.drv_text(text) {
+            return;
+        }
+        if let Some(m) = self.menu.as_mut().filter(|m| m.page == StartPage::Multiplayer && m.mp_tab == 0 && m.addr_focus && !ctrl) {
             let clean: String = text.chars().filter(|c| !c.is_control()).collect();
             if !clean.is_empty() && m.addr_sel {
                 m.address.clear();
@@ -30,10 +33,11 @@ impl App {
         let pic = self.ui.as_ref().map_or([0.0; 4], |u| u.start.route_rect);
         let dbox = self.ui.as_ref().map_or([0.0; 4], |u| u.start.drop_box);
         let (vw, tfield) = self.ui.as_ref().map_or((8, [0.0; 4]), |u| (u.start.weather_vis, u.start.time_field));
+        let vi = self.ui.as_ref().map_or(6, |u| u.start.icao_vis);
         let (ve, ebox) = self.ui.as_ref().map_or((6, [0.0; 4]), |u| (u.start.entry_vis, u.start.entry_box));
         if let Some(m) = self.menu.as_mut().filter(|m| m.page == StartPage::Start) {
             match m.sect {
-                1 | 2 if m.drop != 0 && hit(&[dbox], cursor).is_some() => {
+                1 | 2 | 3 if m.drop != 0 && hit(&[dbox], cursor).is_some() => {
                     let max = m.drop_items(m.drop).len().saturating_sub(6) as f32;
                     m.drop_top = (m.drop_top as f32 - amount * 2.0).clamp(0.0, max).round() as usize;
                 }
@@ -71,6 +75,10 @@ impl App {
                         m.step_minute(dir);
                     }
                 }
+                3 if m.weather == 2 => {
+                    let max = m.icao_matches(5).len().saturating_sub(vi) as f32;
+                    m.icao_top = (m.icao_top as f32 - amount * 2.0).clamp(0.0, max).round() as usize;
+                }
                 3 => {
                     let max = m.weathers.len().saturating_sub(vw) as f32;
                     m.weather_top = (m.weather_top as f32 - amount * 2.0).clamp(0.0, max).round() as usize;
@@ -94,6 +102,9 @@ impl App {
                 }
                 return;
             }
+            if self.drv_click(cursor) {
+                return;
+            }
             if self.ui.as_ref().is_some_and(|u| hit(&[u.start.quit], cursor).is_some()) {
                 crate::platform::exit(event_loop);
                 return;
@@ -107,10 +118,22 @@ impl App {
             return;
         }
         if !pressed {
+            let click = self
+                .menu
+                .as_ref()
+                .filter(|m| m.sect == 1)
+                .and_then(|m| m.drag)
+                .is_some_and(|(from, _)| (cursor.0 - from.0).hypot(cursor.1 - from.1) < 5.0);
+            if click {
+                self.start_entry_click(cursor);
+            }
             if let Some(m) = self.menu.as_mut() {
                 m.drag = None;
                 m.slider = None;
             }
+            return;
+        }
+        if self.drv_click(cursor) {
             return;
         }
         let Some(u) = self.ui.as_ref() else {
@@ -138,6 +161,7 @@ impl App {
                     }
                 }
                 enum Act {
+                    DropBar,
                     Go,
                     Cont,
                     Close,
@@ -193,7 +217,12 @@ impl App {
                     .menu
                     .as_ref()
                     .map_or(0, |m| m.weather_top.min(m.weathers.len().saturating_sub(st.weather_vis)).max(4.min(m.weathers.len())));
-                let act = if hit(&[st.go], cursor).is_some() {
+                let act = if st.drop_box[2] > st.drop_box[0] && hit(&[st.drop_box], cursor).is_some() {
+                    match hit(&st.drop_items, cursor) {
+                        Some(k) => Act::DropItem(st.drop_first + k),
+                        None => Act::DropBar,
+                    }
+                } else if hit(&[st.go], cursor).is_some() {
                     Act::Go
                 } else if hit(&[st.cont], cursor).is_some() {
                     Act::Cont
@@ -267,7 +296,7 @@ impl App {
                     if m.cal_open && !matches!(act, Act::Cal(_) | Act::CalDay(_) | Act::DateField) {
                         m.cal_open = false;
                     }
-                    if m.drop != 0 && !matches!(act, Act::Drop(_) | Act::DropItem(_)) {
+                    if m.drop != 0 && !matches!(act, Act::Drop(_) | Act::DropItem(_) | Act::DropBar) {
                         m.drop = 0;
                     }
                     if matches!(act, Act::TimeField) {
@@ -362,7 +391,7 @@ impl App {
                     }
                     Act::IcaoPick(k) => {
                         if let Some(m) = self.menu.as_mut() {
-                            if let Some((code, _)) = m.icao_matches(5).get(k) {
+                            if let Some((code, _)) = m.icao_matches(5).get(m.icao_top + k) {
                                 m.icao = code.clone();
                             }
                         }
@@ -405,6 +434,15 @@ impl App {
                                 3 => 13 + k,
                                 _ => 8 + k,
                             });
+                        }
+                    }
+                    Act::DropBar => {
+                        let bx = self.ui.as_ref().map_or([0.0; 4], |u| u.start.drop_box);
+                        if cursor.0 >= bx[2] - ((bx[2] - bx[0]) * 0.06).max(16.0) {
+                            if let Some(m) = self.menu.as_mut() {
+                                m.slider = Some(usize::MAX);
+                            }
+                            self.start_slider_drag();
                         }
                     }
                     Act::DropItem(i) => {
@@ -470,6 +508,13 @@ impl App {
                 let go = hit(&[st.go], cursor).is_some();
                 let host = hit(&[st.host_row], cursor).is_some();
                 let tab0 = self.menu.as_ref().is_some_and(|m| m.mp_tab == 0);
+                let on_field = tab0 && hit(&[st.field], cursor).is_some();
+                if let Some(m) = self.menu.as_mut() {
+                    m.addr_focus = on_field;
+                    if !on_field {
+                        m.addr_sel = false;
+                    }
+                }
                 if let Some(k) = tab {
                     if let Some(m) = self.menu.as_mut() {
                         m.mp_tab = k;
@@ -488,7 +533,7 @@ impl App {
                     self.start_join_server(event_loop, k);
                 }
             }
-            StartPage::Options => {}
+            StartPage::Options | StartPage::Profile => {}
         }
     }
 }

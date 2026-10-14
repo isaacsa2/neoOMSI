@@ -50,9 +50,18 @@ impl Ui {
         let first = top.min(n.saturating_sub(vis));
         let bar_room = if n > vis { 14.0 * u } else { 0.0 };
         let px = (15.0 * u) as u32;
-        for (k, i) in (first..n.min(first + vis)).enumerate() {
-            let y = a[1] + k as f32 * row_h;
-            let rc = [a[0], y, a[2] - bar_room, y + row_h];
+        let (i0, frac) = self.glide_rows(id, first);
+        let bottom = a[1] + vis as f32 * row_h;
+        let slots = vis.min(n - first);
+        let mut slot_rects = vec![[0.0f32; 4]; slots];
+        let alpha0 = self.text.alpha;
+        for i in i0..n.min(i0 + vis + 1) {
+            let y = a[1] + ((i - i0) as f32 - frac) * row_h;
+            let Some((vy0, vy1, seen)) = row_seen(a[1], bottom, y, row_h) else {
+                continue;
+            };
+            let rc = [a[0], vy0, a[2] - bar_room, vy1];
+            self.text.alpha = alpha0 * seen.powi(3);
             let on = sel == Some(i);
             let hot = inside(rc, f.cursor);
             let hv = self.ease((id, "item", i), if hot || on { 1.0 } else { 0.0 }, 10.0);
@@ -85,16 +94,36 @@ impl Ui {
                 let l = self.text.label(r, scene, &name, px, col);
                 l.place(scene, rc[0] + TEXT_IN * u, y + (row_h - l.h as f32) * 0.5);
             }
-            rects.push(rc);
+            if i >= first && i - first < slots {
+                slot_rects[i - first] = rc;
+            }
         }
+        self.text.alpha = alpha0;
+        rects.extend(slot_rects);
         if n > vis {
             let track = [a[2] - 6.0 * u, a[1], a[2], a[1] + vis as f32 * row_h];
             self.text.rounded(r, scene, track, 3.0 * u, OPT_TRACK);
             let th = ((vis as f32 / n as f32) * (track[3] - track[1])).max(24.0 * u);
-            let ty = track[1] + (track[3] - track[1] - th) * first as f32 / (n - vis) as f32;
+            let ty = track[1] + (track[3] - track[1] - th) * (i0 as f32 + frac) / (n - vis) as f32;
             self.text.rounded(r, scene, [track[0], ty, track[2], ty + th], 3.0 * u, [255, 255, 255, 60]);
         }
         vis
+    }
+
+    pub(super) fn glide_rows(&mut self, id: u8, target: usize) -> (usize, f32) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (id, "glide", 0usize).hash(&mut h);
+        let k = 1.0 - (-self.anim_dt * 20.0).exp();
+        let t = target as f32;
+        let v = self.anim.entry(h.finish()).or_insert(t);
+        *v += (t - *v) * k;
+        if (t - *v).abs() < 0.01 {
+            *v = t;
+        }
+        let s = v.max(0.0);
+        let i0 = s.floor() as usize;
+        (i0, s - i0 as f32)
     }
 
     pub(super) fn start_art(&mut self, r: &Renderer, scene: &mut Scene, a: [f32; 4], icon: &str) {
@@ -131,75 +160,6 @@ impl Ui {
         gl.place(scene, gx, rc[1] + (bh - gl.h as f32) * 0.5);
         if let Some(ic) = self.text.icon(r, scene, icon, gi as u32, ON_ACCENT) {
             ic.place(scene, gx + gl.w as f32 + 8.0 * u, rc[1] + (bh - gi) * 0.5);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn start_stepper(
-        &mut self,
-        r: &Renderer,
-        scene: &mut Scene,
-        f: &Frame,
-        rc: [f32; 4],
-        i: usize,
-        label: &str,
-        value: &str,
-        v: &StartView,
-        u: f32,
-        wide: bool,
-        bar: Option<f32>,
-        out: &mut Hits,
-    ) {
-        let h = rc[3] - rc[1];
-        let focus = v.zone == 1 && v.row == i;
-        let hot = inside(rc, f.cursor);
-        let hv = self.ease((213, "row", i), if focus || hot { 1.0 } else { 0.0 }, 10.0);
-        self.text.rounded(r, scene, rc, ROW_R * u, mix(OPT_ROW, OPT_ROW_HOT, hv));
-        let fv = self.ease((213, "rowon", i), if focus { 1.0 } else { 0.0 }, 10.0);
-        if fv > 0.0 {
-            self.accent_bar(r, scene, rc, fv, false, u);
-        }
-        let th = if bar.is_some() { h - 26.0 * u } else { h };
-        let aw = (30.0 * u).round();
-        let isz = (20.0 * u).round();
-        let ra = [rc[2] - 8.0 * u - aw, rc[1], rc[2] - 8.0 * u, rc[1] + th];
-        let la = [ra[0] - aw, rc[1], ra[0], rc[1] + th];
-        for (k, (rect, name)) in [(la, "chevron_left"), (ra, "chevron_right")].into_iter().enumerate() {
-            let av = self.ease((214, name, i), if inside(rect, f.cursor) { 1.0 } else { 0.0 }, 12.0);
-            if let Some(ic) = self.text.icon(r, scene, name, isz as u32, mix(MUTED, WHITE, av)) {
-                ic.place(scene, rect[0] + (aw - isz) * 0.5, rc[1] + (th - isz) * 0.5);
-            }
-            out.1[i * 2 + k] = rect;
-        }
-        out.0[i] = rc;
-        let tx = rc[0] + TEXT_IN * u;
-        let room = (la[0] - 8.0 * u - tx).max(30.0 * u);
-        let lpx = ((if wide { 15.0 } else { 11.0 }) * u) as u32;
-        let vpx = (16.0 * u) as u32;
-        let ll = self.text.label(r, scene, label, lpx, if focus || hot { SOFT } else { MUTED });
-        let text = clip_to(&self.text, value, vpx as f32, if wide { room - ll.w as f32 - 12.0 * u } else { room });
-        let vl = self.text.label(r, scene, &text, vpx, if focus { ACCENT_TEXT } else { WHITE });
-        if wide {
-            ll.place(scene, tx, rc[1] + (h - ll.h as f32) * 0.5);
-            let vx = la[0] - 8.0 * u - vl.w as f32;
-            vl.place(scene, vx.max(tx + ll.w as f32 + 12.0 * u), rc[1] + (h - vl.h as f32) * 0.5);
-        } else {
-            let total = (ll.h + vl.h) as f32;
-            let y = rc[1] + (th - total) * 0.5;
-            ll.place(scene, tx, y);
-            vl.place(scene, tx, y + ll.h as f32);
-        }
-        if let Some(frac) = bar {
-            let (x0, x1) = (rc[0] + TEXT_IN * u, rc[2] - TEXT_IN * u);
-            let ty = rc[3] - 16.0 * u;
-            let t = 5.0 * u;
-            self.text.rounded(r, scene, [x0, ty, x1, ty + t], t * 0.5, OPT_LINE);
-            let fx = x0 + (x1 - x0) * frac;
-            if frac > 0.0 {
-                self.text.rounded(r, scene, [x0, ty, fx.max(x0 + t), ty + t], t * 0.5, ACCENT);
-            }
-            let k = 8.0 * u;
-            self.text.rounded(r, scene, [fx - k, ty + t * 0.5 - k, fx + k, ty + t * 0.5 + k], k, WHITE_FILL);
         }
     }
 }

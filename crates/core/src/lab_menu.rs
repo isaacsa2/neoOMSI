@@ -13,7 +13,7 @@ pub(crate) struct PlaceSel {
     pub pick: usize,
 }
 
-type LabGroup = (String, Vec<(String, String)>, crate::lab_options::Subs);
+type LabGroup = (String, Vec<(String, String)>, lab_options::Subs);
 
 fn pick_row(groups: &[LabGroup], g: usize, sub: usize, k: usize) -> Option<(String, String)> {
     let gr = groups.get(g)?;
@@ -42,13 +42,13 @@ fn view_rows(rows: &[(String, String)]) -> Vec<WorldRow> {
 }
 
 thread_local! {
-    static SYNC: std::cell::Cell<Option<(std::time::Instant, Option<usize>)>> = const { std::cell::Cell::new(None) };
+    static SYNC: std::cell::Cell<Option<(Instant, Option<usize>)>> = const { std::cell::Cell::new(None) };
     static SYNC_NOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static ADMIN_CACHE: std::cell::RefCell<Option<(std::time::Instant, Vec<(String, String)>)>> = const { std::cell::RefCell::new(None) };
+    static ADMIN_CACHE: std::cell::RefCell<Option<(Instant, Vec<(String, String)>)>> = const { std::cell::RefCell::new(None) };
 }
 
 fn tl(key: &str) -> String {
-    ::i18n::translate(key, &[])
+    i18n::translate(key, &[])
 }
 
 const PLACE_FIELDS: [&str; 4] = [
@@ -63,7 +63,7 @@ impl App {
         self.game_menu_items()
             .into_iter()
             .filter(|(id, _)| !id.starts_with("report"))
-            .map(|(id, label)| (id, ::i18n::translate(label, &[])))
+            .map(|(id, label)| (id, i18n::translate(label, &[])))
             .collect()
     }
 
@@ -128,20 +128,20 @@ impl App {
     pub(crate) fn lab_voice_shown(&self) -> bool {
         self.lab_group_page() == Some(OPTIONS_PAGE)
             && self.ui.as_ref().is_some_and(|u| {
-                u.world_sub > 0
-                    && u.world_view
-                        .get(u.world_group)
-                        .and_then(|g| g.subs.get(u.world_sub - 1))
-                        .is_some_and(|s| s.title == VOICE_SUB)
-            })
+            u.world_sub > 0
+                && u.world_view
+                .get(u.world_group)
+                .and_then(|g| g.subs.get(u.world_sub - 1))
+                .is_some_and(|s| s.title == VOICE_SUB)
+        })
     }
 
     fn lab_sync_due(&self) -> bool {
         let page = self.lab_group_page();
         let live = self.lab_voice_shown()
             || self.ui.as_ref().is_some_and(|u| {
-                u.world_drag.is_some() || u.world_bar_grab.is_some() || (page == Some(OPTIONS_PAGE) && u.world_sub >= 2)
-            });
+            u.world_drag.is_some() || u.world_bar_grab.is_some() || (page == Some(OPTIONS_PAGE) && u.world_sub >= 2)
+        });
         let forced = SYNC_NOW.with(|c| c.replace(false));
         SYNC.with(|c| {
             let due = live
@@ -1002,6 +1002,20 @@ impl App {
         }
     }
 
+    /// Rebuilds the open list's lines, keeping the selection.
+    pub(crate) fn lab_list_refresh(&mut self) {
+        let Some(kind) = self.lab_list.as_ref().map(|l| l.1.clone()) else {
+            return;
+        };
+        let list = crate::game_lists::items(self, &kind);
+        let idx: Vec<usize> = (0..list.len()).filter(|&k| list[k].1 != crate::game_lists::HEADING).collect();
+        let opts = idx.iter().map(|&k| list[k].0.clone()).collect();
+        self.lab_list = Some((list, kind, idx));
+        if let Some(Dialog::Select { options, .. }) = self.ui.as_mut().and_then(|u| u.dialog.as_mut()) {
+            *options = opts;
+        }
+    }
+
     pub(crate) fn lab_dialog_text(&mut self, text: &str) {
         if let Some(mut q) = self.lab_search() {
             q.extend(text.chars().filter(|c| !c.is_control()));
@@ -1148,6 +1162,7 @@ impl App {
             "world" => page(self, 2),
             "vehicle" => page(self, VEHICLE_PAGE),
             "admin" => page(self, ADMIN_PAGE),
+            "mainmenu" => self.back_to_main_menu(),
             "quit" => {
                 self.game_menu = None;
                 self.lab_menu = None;
@@ -1278,6 +1293,14 @@ impl App {
             } else {
                 self.time_edit_key(code);
             }
+            return;
+        }
+        if self.route_editing() && self.lab_list.is_some() {
+            if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) {
+                self.lab_dialog_close();
+            }
+            self.route_edit_key(code);
+            self.lab_list_refresh();
             return;
         }
         if self.lab_place.is_some() && self.lab_list.is_none() {
@@ -1507,12 +1530,12 @@ impl App {
 }
 
 pub(crate) fn scan_vehicles(
-    root: std::path::PathBuf,
+    root: PathBuf,
     map: String,
-) -> std::sync::mpsc::Receiver<crate::app::VehicleScan> {
+) -> std::sync::mpsc::Receiver<VehicleScan> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let menu = crate::menu::Menu::new(&root, &map);
+        let menu = menu::Menu::new(&root, &map);
         let meta = menu.vehicles.iter().zip(menu.vehicle_meta).map(|(v, m)| (v.1.clone(), m)).collect();
         let _ = tx.send((menu.vehicles, meta));
     });

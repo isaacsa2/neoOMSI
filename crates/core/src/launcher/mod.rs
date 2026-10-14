@@ -12,7 +12,6 @@ pub(crate) mod drive;
 pub mod mobile;
 mod multiplayer;
 mod pages;
-pub mod phone;
 mod settings;
 mod state;
 #[cfg_attr(not(target_os = "android"), allow(unused_imports))]
@@ -100,8 +99,6 @@ pub struct Launcher {
     page: Page,
     page_anim: f32,
     pub drive: drive::DriveView,
-    /// The launcher made for a phone (see `phone`).
-    pub phone: phone::PhoneView,
     pub pages: pages::PagesView,
     pub settings: settings::SettingsView,
     pub mp: multiplayer::MultiplayerView,
@@ -168,7 +165,6 @@ impl Launcher {
             page: Page::Drive,
             page_anim: 1.0,
             drive: drive::DriveView::default(),
-            phone: phone::PhoneView::default(),
             pages: pages::PagesView::default(),
             settings: settings::SettingsView::default(),
             mp: multiplayer::MultiplayerView::default(),
@@ -239,26 +235,6 @@ impl Launcher {
                 .find(|(_, n, _)| n.eq_ignore_ascii_case(p.split(':').next().unwrap_or("")))
             {
                 app.page = *pg;
-                // (the phone's tab for it)
-                app.phone.tab = match pg {
-                    Page::Drive => phone::Tab::Play,
-                    Page::Multiplayer => phone::Tab::Online,
-                    Page::Mods => phone::Tab::Mods,
-                    other => {
-                        app.phone.page = Some(*other);
-                        phone::Tab::More
-                    }
-                };
-            }
-            // (`OMSI_LAUNCHER_PAGE=more`, `=sheet-bus` …: the phone's More, or one of its sheets)
-            match p.as_str() {
-                "more" => app.phone.tab = phone::Tab::More,
-                "sheet-map" => app.phone.sheet = Some(phone::Sheet::Map),
-                "sheet-bus" => app.phone.sheet = Some(phone::Sheet::Bus),
-                "sheet-duty" => app.phone.sheet = Some(phone::Sheet::Duty),
-                "sheet-time" => app.phone.sheet = Some(phone::Sheet::Time),
-                "sheet-livery" => app.phone.sheet = Some(phone::Sheet::Livery),
-                _ => {}
             }
             if let Some(step) = p.split(':').nth(1).and_then(|s| s.parse().ok()) {
                 app.drive.step = step;
@@ -532,6 +508,16 @@ impl ApplicationHandler for Launcher {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                if !event.repeat
+                    && self.modifiers.alt_key()
+                    && matches!(
+                        event.physical_key,
+                        PhysicalKey::Code(KeyCode::Enter)
+                    )
+                {
+                    self.toggle_fullscreen();
+                    return;
+                }
                 let cmd = self.modifiers.control_key() || self.modifiers.super_key();
                 // a phone's back key: out of the storage browser, else like Escape
                 if event.physical_key == PhysicalKey::Code(KeyCode::BrowserBack) {
@@ -643,6 +629,26 @@ impl ApplicationHandler for Launcher {
 }
 
 impl Launcher {
+    /// The conventional Alt+Enter shortcut switches the launcher and the game between a
+    /// normal window and exclusive fullscreen.
+    fn toggle_fullscreen(&self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let mode = if ::config::get_bool("graphics", "triple_screen").unwrap_or(false)
+            || window.fullscreen().is_some()
+        {
+            "windowed"
+        } else {
+            "fullscreen"
+        };
+        ::config::set_setting("graphics", "window_mode", mode);
+        let _ = ::config::save();
+        let fullscreen = (mode == "fullscreen")
+            .then(|| crate::game_lists::exclusive_fullscreen(window));
+        window.set_fullscreen(fullscreen);
+    }
+
     /// Physical pixels per interface pixel: the screen's scale, times a zoom that makes the
     /// interface (laid out for a 1440 x 880 window) grow with a bigger window and shrink a
     /// little with a smaller one, so that it fills the window the same way at any size.
@@ -1227,50 +1233,47 @@ impl Launcher {
             i
         });
         // a phone: the launcher made for it, not the desktop's pages
-        if mobile {
-            phone::draw(self);
+        let rail_w = RAIL_W;
+        self.page_anim = (self.page_anim + self.ui.dt / 0.15).min(1.0);
+        // (no wider than a page reads well: on a wide screen the rest is margin, the page
+        // in the middle - the panels stretched across 2000 px with their text at one end)
+        let (margin, top) = if mobile { (36.0, 14.0) } else { (64.0, 28.0) };
+        let avail = size.x - rail_w - margin;
+        let w = avail.min(1760.0);
+        let seen = size.y - top - 40.0;
+        // (a phone: laid out for a taller screen, scrolled)
+        let h = if mobile {
+            seen.max(mobile::PAGE_H)
         } else {
-            let rail_w = RAIL_W;
-            self.page_anim = (self.page_anim + self.ui.dt / 0.15).min(1.0);
-            // (no wider than a page reads well: on a wide screen the rest is margin, the page
-            // in the middle - the panels stretched across 2000 px with their text at one end)
-            let (margin, top) = if mobile { (36.0, 14.0) } else { (64.0, 28.0) };
-            let avail = size.x - rail_w - margin;
-            let w = avail.min(1760.0);
-            let seen = size.y - top - 40.0;
-            // (a phone: laid out for a taller screen, scrolled)
-            let h = if mobile {
-                seen.max(mobile::PAGE_H)
-            } else {
-                seen
-            };
-            self.page_max = (h - seen).max(0.0);
-            self.page_scroll = self.page_scroll.clamp(0.0, self.page_max);
-            let content = Rect::new(
-                rail_w + margin * 0.5 + (avail - w) * 0.5,
-                top - self.page_scroll,
-                w,
-                h,
-            );
-            let e = 1.0 - (1.0 - self.page_anim).powi(3);
-            let content = Rect::new(content.x + 8.0 * (1.0 - e), content.y, content.w, content.h);
-            if self.page != Page::Settings {
-                self.settings.leave();
-            }
-            match self.page {
-                Page::Drive => drive::draw(self, content),
-                Page::Multiplayer => multiplayer::draw(self, content),
-                Page::Profile => pages::profile(self, content),
-                Page::Settings => settings::page(self, content),
-                Page::Sessions => pages::sessions(self, content),
-                Page::Mods => pages::mods(self, content),
-                Page::Tutorials => pages::tutorials(self, content),
-                Page::Timetable => timetable::draw(self, content),
-            }
-            // the rail over the page (a scrolled page passes under it)
-            self.rail();
-            self.status_bar();
+            seen
+        };
+        self.page_max = (h - seen).max(0.0);
+        self.page_scroll = self.page_scroll.clamp(0.0, self.page_max);
+        let content = Rect::new(
+            rail_w + margin * 0.5 + (avail - w) * 0.5,
+            top - self.page_scroll,
+            w,
+            h,
+        );
+        let e = 1.0 - (1.0 - self.page_anim).powi(3);
+        let content = Rect::new(content.x + 8.0 * (1.0 - e), content.y, content.w, content.h);
+        if self.page != Page::Settings {
+            self.settings.leave();
         }
+        match self.page {
+            Page::Drive => drive::draw(self, content),
+            Page::Multiplayer => multiplayer::draw(self, content),
+            Page::Profile => pages::profile(self, content),
+            Page::Settings => settings::page(self, content),
+            Page::Sessions => pages::sessions(self, content),
+            Page::Mods => pages::mods(self, content),
+            Page::Tutorials => pages::tutorials(self, content),
+            Page::Timetable => timetable::draw(self, content),
+        }
+        // the rail over the page (a scrolled page passes under it)
+        self.rail();
+        self.status_bar();
+
         self.draw_updated_notice();
         if let Some(i) = saved {
             self.ui.input = i;
@@ -1365,24 +1368,6 @@ impl Launcher {
             self.page = p;
             self.page_anim = 0.0;
             self.page_scroll = 0.0;
-            self.phone.page = match p {
-                Page::Drive => {
-                    self.phone.tab = phone::Tab::Play;
-                    None
-                }
-                Page::Multiplayer => {
-                    self.phone.tab = phone::Tab::Online;
-                    None
-                }
-                Page::Mods => {
-                    self.phone.tab = phone::Tab::Mods;
-                    None
-                }
-                other => {
-                    self.phone.tab = phone::Tab::More;
-                    Some(other)
-                }
-            };
             match p {
                 Page::Profile => self.state.load_profile(),
                 Page::Mods => self.state.load_mods(),
