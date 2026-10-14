@@ -21,6 +21,7 @@ struct Face {
     /// Texture coordinates at the corners.
     uv: [[f32; 2]; 3],
     material: u32,
+    texture: u32,
     level: i8,
 }
 
@@ -29,28 +30,24 @@ const LEVEL_GAP: f64 = 4.0;
 /// A face is a floor when its normal is at most this far off the vertical (cos).
 const UPRIGHT: f32 = 0.8;
 
-/// A texture a material is read from: its name as given, where to look for it, its `.cfg`
-/// and how many meshes name it so
 struct Source {
     file: String,
     dirs: Vec<std::path::PathBuf>,
     cfg: ::texture::TextureCfg,
     uses: u32,
+    texture: u32,
 }
 
 #[derive(Default)]
 struct Materials {
     ids: HashMap<String, u32>,
     names: Vec<String>,
-    /// Each material's sources by their hash: textures of one name in other folders may be
-    /// other pictures (see `settle`)
     sources: Vec<HashMap<u64, Source>>,
+    textures: Vec<(String, Vec<std::path::PathBuf>, u32)>,
 }
 
 impl Materials {
-    /// The material of a texture as an asset names it: one per file name, whatever its
-    /// folder or extension (a `.bmp` and a `.dds` of the same picture are one).
-    fn id(this: &Mutex<Materials>, file: &str, dirs: &[std::path::PathBuf]) -> u32 {
+    fn id(this: &Mutex<Materials>, file: &str, dirs: &[std::path::PathBuf]) -> (u32, u32) {
         use std::hash::{Hash, Hasher};
         let base = file.replace('\\', "/");
         let base = base.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
@@ -77,7 +74,7 @@ impl Materials {
             };
             if let Some(s) = m.sources[id as usize].get_mut(&print) {
                 s.uses += 1;
-                return id;
+                return (id, s.texture);
             }
             id
         };
@@ -86,19 +83,24 @@ impl Materials {
             .and_then(|p| ::texture::cfg_path(file, &p))
             .map(|c| ::texture::TextureCfg::load(&c))
             .unwrap_or_default();
-        this.lock().sources[id as usize]
-            .entry(print)
-            .or_insert(Source {
+        let mut m = this.lock();
+        let m = &mut *m;
+        let s = m.sources[id as usize].entry(print).or_insert_with(|| {
+            m.textures.push((file.to_string(), dirs.to_vec(), id));
+            Source {
                 file: file.to_string(),
                 dirs: dirs.to_vec(),
                 cfg,
                 uses: 0,
-            })
-            .uses += 1;
-        id
+                texture: m.textures.len() as u32 - 1,
+            }
+        });
+        s.uses += 1;
+        (id, s.texture)
     }
 
-    fn settle(self) -> (Vec<String>, Vec<Source>) {
+    #[allow(clippy::type_complexity)]
+    fn settle(self) -> (Vec<String>, Vec<Source>, Vec<(String, Vec<std::path::PathBuf>, u32)>) {
         let sources = self
             .sources
             .into_iter()
@@ -112,7 +114,7 @@ impl Materials {
                     .expect("a material has a source")
             })
             .collect();
-        (self.names, sources)
+        (self.names, sources, self.textures)
     }
 }
 
@@ -190,7 +192,7 @@ impl Evidence {
 
 /// The floor faces of an object type in its own frame, with their materials.
 struct ObjectFloors {
-    faces: Vec<([Vec3; 3], [[f32; 2]; 3], u32)>,
+    faces: Vec<([Vec3; 3], [[f32; 2]; 3], (u32, u32))>,
     /// It carries a street: its floors may be bridge decks high above the ground.
     streets: bool,
     /// `[absolute_height]`: placed at the height the map gives, not on the ground.
@@ -410,7 +412,8 @@ struct Gathered {
 
 impl Gathered {
     /// Count a face for its material and file it under every chunk it reaches
-    fn add(&mut self, w: [DVec3; 3], uv: [[f32; 2]; 3], material: u32, ground: f64, ev: &Evidence) {
+    fn add(&mut self, w: [DVec3; 3], uv: [[f32; 2]; 3], ids: (u32, u32), ground: f64, ev: &Evidence) {
+        let (material, texture) = ids;
         let area = (w[1] - w[0]).truncate().perp_dot((w[2] - w[0]).truncate()).abs() * 0.5;
         if area < 1e-4 {
             return;
@@ -459,6 +462,7 @@ impl Gathered {
                     v,
                     uv,
                     material,
+                    texture,
                     level,
                 });
             }
@@ -620,7 +624,7 @@ pub fn build_surface_stream(
                 let Some(gt) = world.global.ground_textures.get(layer) else {
                     continue;
                 };
-                let material = Materials::id(&materials, &gt.texture, &paint_dirs);
+                let (material, _) = Materials::id(&materials, &gt.texture, &paint_dirs);
                 let (w, h) = (img.width as usize, img.height as usize);
                 let alpha: Vec<u8> = img.rgba.chunks_exact(4).map(|p| p[3]).collect();
                 if w == 0 || h == 0 || !alpha.iter().any(|&a| a >= 128) {
@@ -773,7 +777,7 @@ pub fn build_surface_stream(
             faces.entry(k).or_default().append(&mut v);
         }
     }
-    let (names, sources) = materials.into_inner().settle();
+    let (names, sources, textures) = materials.into_inner().settle();
     for s in &sources {
         let refs: Vec<&Path> = s.dirs.iter().map(|d| d.as_path()).collect();
         if let Some(p) = ::texture::find_texture(&s.file, &refs) {
@@ -800,33 +804,51 @@ pub fn build_surface_stream(
         });
     }
     let t_gather = t0.elapsed().as_secs_f64();
-    // the paint on the carriageways' textures: lines, arrows, stop lines, crossings
-    let paint_masks: Vec<Option<raster::PaintMask>> = (0..names.len())
+    let mut files: Vec<Option<std::path::PathBuf>> = Vec::with_capacity(textures.len());
+    for (file, dirs, material) in &textures {
+        let i = *material as usize;
+        let road = matches!(
+            Surface::from_u8(class[i]),
+            Some(Surface::Road | Surface::Paved)
+        );
+        // the shining heads of tram rails set in the road are not paint
+        let name = &infos[i].name;
+        let rails = infos[i].rail >= 0.25
+            || ["rail", "gleis", "strab", "schiene", "tram"].iter().any(|w| name.contains(w));
+        let found = (road && !rails)
+            .then(|| {
+                let refs: Vec<&Path> = dirs.iter().map(|d| d.as_path()).collect();
+                ::texture::find_texture(file, &refs)
+            })
+            .flatten();
+        if let Some(p) = &found {
+            deps.add(p);
+        }
+        files.push(found);
+    }
+    let mut unique: Vec<&std::path::PathBuf> = files.iter().flatten().collect();
+    unique.sort();
+    unique.dedup();
+    let decoded: HashMap<&std::path::PathBuf, Arc<raster::PaintMask>> = unique
         .into_par_iter()
-        .map(|i| {
-            let s = Surface::from_u8(class[i])?;
-            if !matches!(s, Surface::Road | Surface::Paved) {
-                return None;
-            }
-            // the shining heads of tram rails set in the road are not paint
-            let name = &infos[i].name;
-            if infos[i].rail >= 0.25
-                || ["rail", "gleis", "strab", "schiene", "tram"].iter().any(|w| name.contains(w))
-            {
-                return None;
-            }
-            let (file, dirs) = (&sources[i].file, &sources[i].dirs);
-            let refs: Vec<&Path> = dirs.iter().map(|d| d.as_path()).collect();
-            let img = ::texture::decode_file(&::texture::find_texture(file, &refs)?).ok()?;
-            raster::PaintMask::from_rgba(
+        .filter_map(|p| {
+            let img = ::texture::decode_file(p).ok()?;
+            let m = raster::PaintMask::from_rgba(
                 img.width as usize,
                 img.height as usize,
                 &img.rgba,
                 img.has_alpha,
-            )
+            )?;
+            Some((p, Arc::new(m)))
         })
+        .collect::<Vec<_>>()
+        .into_iter()
         .collect();
-    let with_paint = paint_masks.iter().filter(|m| m.is_some()).count();
+    let paint_masks: Vec<Option<Arc<raster::PaintMask>>> = files
+        .iter()
+        .map(|f| f.as_ref().and_then(|p| decoded.get(p).cloned()))
+        .collect();
+    let with_paint = decoded.len();
     for v in paints.values_mut() {
         v.sort_by_key(|p| std::cmp::Reverse(p.layer));
     }
@@ -895,7 +917,7 @@ pub fn build_surface_stream(
         );
     }
     log::info!(
-        "navigator surfaces: {} materials ({} with road paint), {} object types, {} chunks, {} areas, {:.1} s ({:.1} s gathering)",
+        "navigator surfaces: {} materials ({} textures with road paint), {} object types, {} chunks, {} areas, {:.1} s ({:.1} s gathering)",
         infos.len(),
         with_paint,
         objects.lock().len(),
@@ -971,7 +993,7 @@ fn build_chunk(
     key: (i32, i32),
     faces: &[Face],
     class: &[u8],
-    paint: &[Option<raster::PaintMask>],
+    paint: &[Option<Arc<raster::PaintMask>>],
     painted: &PaintedGround,
 ) -> Chunk {
     let mut chunk = Chunk::default();
@@ -1031,7 +1053,7 @@ fn build_chunk(
         let mut paint_r: Option<Raster> = None;
         for f in faces.iter().filter(|f| f.level == level) {
             let c = class.get(f.material as usize).copied().unwrap_or(0);
-            let Some(m) = paint.get(f.material as usize).and_then(|m| m.as_ref()) else {
+            let Some(m) = paint.get(f.texture as usize).and_then(|m| m.as_deref()) else {
                 continue;
             };
             let to_fine = |v: [f32; 3]| {
