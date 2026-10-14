@@ -200,12 +200,40 @@ fn lanes_beside_start(net: &Network, n: usize) -> impl Iterator<Item = usize> + 
     })
 }
 
+/// The way from the bus at `bus`, heading `heading`, onto the lanes `ahead` (the route ahead):
+/// the lanes leading there (not the one joined) and which of `ahead` is joined - the first
+/// one the bus can reach, at most `max_cost` m away.
 pub(crate) fn way_back(
     net: &Network,
     bus: DVec3,
     heading: f64,
     ahead: &[usize],
     max_cost: f32,
+) -> Option<(Vec<usize>, usize)> {
+    way_search(net, bus, heading, ahead, max_cost, false)
+}
+
+/// As [`way_back`], onto route lanes that end at the stop the bus is due at: the join that
+/// makes the way to that stop the shortest. Off the route the lanes just behind the bus are
+/// often the first it can reach - round the block, or on to a place to turn - while the
+/// route ahead is nearer the stop: the bus was sent back to turn, over and over.
+pub(crate) fn way_to_stop(
+    net: &Network,
+    bus: DVec3,
+    heading: f64,
+    ahead: &[usize],
+    max_cost: f32,
+) -> Option<(Vec<usize>, usize)> {
+    way_search(net, bus, heading, ahead, max_cost, true)
+}
+
+fn way_search(
+    net: &Network,
+    bus: DVec3,
+    heading: f64,
+    ahead: &[usize],
+    max_cost: f32,
+    to_end: bool,
 ) -> Option<(Vec<usize>, usize)> {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
@@ -240,9 +268,15 @@ pub(crate) fn way_back(
         );
     }
     let start = start?;
+    let ahead = &ahead[..ahead.len().min(120)];
     let mut targets: HashMap<usize, usize> = HashMap::new();
-    for (k, &l) in ahead.iter().take(120).enumerate() {
+    for (k, &l) in ahead.iter().enumerate() {
         targets.entry(l).or_insert(k);
+    }
+    // the route from the start of each of `ahead` to its end (the stop)
+    let mut rest = vec![0.0f32; ahead.len() + 1];
+    for k in (0..ahead.len()).rev() {
+        rest[k] = rest[k + 1] + net.lanes.get(ahead[k]).map_or(0.0, |l| l.length());
     }
     #[derive(PartialEq)]
     struct Node(f32, usize);
@@ -262,21 +296,37 @@ pub(crate) fn way_back(
     let mut heap = BinaryHeap::new();
     dist.insert(start, 0.0);
     heap.push(Node(0.0, start));
+    let path_to = |parent: &HashMap<usize, usize>, lane: usize| {
+        let mut path = vec![lane];
+        let mut c = lane;
+        while let Some(&p) = parent.get(&c) {
+            path.push(p);
+            c = p;
+        }
+        path.reverse();
+        path.pop();
+        path
+    };
+    // (the best join so far: the way to the stop over it, and where)
+    let mut best: Option<(f32, usize, Vec<usize>)> = None;
     while let Some(Node(cost, lane)) = heap.pop() {
         if cost > dist.get(&lane).copied().unwrap_or(f32::INFINITY) {
             continue;
         }
+        // no join reached later can make the way to the stop shorter
+        if best.as_ref().is_some_and(|b| cost >= b.0) {
+            break;
+        }
         if lane != start {
             if let Some(&k) = targets.get(&lane) {
-                let mut path = vec![lane];
-                let mut c = lane;
-                while let Some(&p) = parent.get(&c) {
-                    path.push(p);
-                    c = p;
+                if !to_end {
+                    return Some((path_to(&parent, lane), k));
                 }
-                path.reverse();
-                path.pop();
-                return Some((path, k));
+                // (`cost` reaches the end of the lane joined)
+                let total = cost + rest[k + 1];
+                if best.as_ref().is_none_or(|b| total < b.0) {
+                    best = Some((total, k, path_to(&parent, lane)));
+                }
             }
         }
         if cost > max_cost {
@@ -306,6 +356,6 @@ pub(crate) fn way_back(
             }
         }
     }
-    None
+    best.map(|(_, k, path)| (path, k))
 }
 

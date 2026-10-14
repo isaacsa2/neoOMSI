@@ -156,17 +156,18 @@ impl Navigator {
         }
         r.retry_in = REROUTE_EVERY;
         let base = r.progress.min(r.lanes.len() - 1);
+        // (the way search looks at 120 lanes: those up to the stop)
         let (lo, hi) = match stop_at {
-            Some(k) => (k.saturating_sub(150).max(base), k + 1),
+            Some(k) => (k.saturating_sub(119).max(base), k + 1),
             None => (base, (base + 120).min(r.lanes.len())),
         };
-        let way = way_back(
-            net,
-            f.bus,
-            f.heading,
-            &r.lanes[lo..hi],
-            if r.joined { 6000.0 } else { 30_000.0 },
-        );
+        let max = if r.joined { 6000.0 } else { 30_000.0 };
+        // up to the stop due next: where the way to it is shortest, ahead rather than back
+        // behind the bus; without it, onto the first lane of the route the bus can reach
+        let way = match stop_at {
+            Some(_) => way_to_stop(net, f.bus, f.heading, &r.lanes[lo..hi], max),
+            None => way_back(net, f.bus, f.heading, &r.lanes[lo..hi], max),
+        };
         if way.is_none() && ::legacy_config::env::var_os("OMSI_DEBUG_NAV").is_some() {
             let info: Vec<_> = r.lanes[lo..hi]
                 .iter()
@@ -185,7 +186,6 @@ impl Navigator {
                 r.off_for
             );
         }
-        let max = if r.joined { 6000.0 } else { 30_000.0 };
         let way = way.map(|(p, j)| (p, lo + j)).or_else(|| {
             let k = stop_at?;
             let st = f.stops.first()?;

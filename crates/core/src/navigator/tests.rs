@@ -585,3 +585,33 @@ fn a_stop_set_back_from_the_route_still_bounds_the_way_back() {
     // far from everything: none
     assert_eq!(follow::stop_lane(&net, &lanes, 0, DVec3::new(500.0, 500.0, 0.0)), None);
 }
+
+#[test]
+fn off_the_route_the_way_to_the_stop_rejoins_ahead_rather_than_back_behind() {
+    // the route north on 0, 1, 2 (the stop at the end of 2); the bus beside it on lane 3,
+    // from where lane 4 leads back onto the start of 1 and lane 5 on to the start of 2
+    let lanes = vec![
+        straight((0.0, 0.0), (0.0, 100.0)),
+        straight((0.0, 100.0), (0.0, 200.0)),
+        straight((0.0, 200.0), (0.0, 300.0)),
+        straight((20.0, 95.0), (20.0, 105.0)),
+        straight((20.0, 105.0), (0.0, 100.0)),
+        straight((20.0, 105.0), (0.0, 200.0)),
+    ];
+    let mut net = Network {
+        lanes,
+        ..Default::default()
+    };
+    for (a, n) in [(0, vec![1]), (1, vec![2]), (3, vec![4, 5]), (4, vec![1]), (5, vec![2])] {
+        net.lanes[a].next = n;
+    }
+    net.build_grid();
+    let route = [0usize, 1, 2];
+    let bus = DVec3::new(20.0, 100.0, 0.0);
+    // the first lane of the route it can reach is behind it...
+    let (_, join) = way_back(&net, bus, 0.0, &route, 6000.0).expect("a way");
+    assert_eq!(join, 1);
+    // ... the way to the stop is shorter on ahead
+    let (path, join) = route::way_to_stop(&net, bus, 0.0, &route, 6000.0).expect("a way");
+    assert_eq!((path, join), (vec![3, 5], 2));
+}
