@@ -470,6 +470,18 @@ impl Gathered {
     }
 }
 
+/// A pedestrian crossing painted on the carriageway, by its texture's name.
+fn crossing(name: &str) -> bool {
+    ["crosswalk", "zebra", "ueberweg", "überweg", "uberweg", "fussgaenger", "fußgänger"]
+        .iter()
+        .any(|w| name.contains(w))
+}
+
+/// A cycle lane or path, by its texture's name.
+fn cycle(name: &str) -> bool {
+    ["radweg", "fahrrad", "bike", "cycle"].iter().any(|w| name.contains(w))
+}
+
 /// Words in a texture's name that say what it shows (the evidence of the paths comes first).
 fn named(name: &str) -> Option<Surface> {
     let has = |words: &[&str]| words.iter().any(|w| name.contains(w));
@@ -512,9 +524,18 @@ pub(super) fn classify(name: &str, cfg: &::texture::TextureCfg, st: [f64; 4]) ->
     } else {
         (0.0, 0.0, 0.0)
     };
+    // (a crossing is the carriageway's, with its stripes on it, not a footway across it;
+    // so is a cycle lane painted on it, its bicycles and lines read as the road's paint)
+    if crossing(name) || (cycle(name) && car >= 0.5) {
+        return Some(Surface::Road);
+    }
     let by_name = named(name);
     if area >= 30.0 {
         if car >= 0.25 && car >= walk {
+            return Some(Surface::Road);
+        }
+        // cars and people both cross it: a crossing over the carriageway
+        if car >= 0.4 && walk >= 0.4 {
             return Some(Surface::Road);
         }
         if rail >= 0.4 && car < 0.1 {
@@ -844,9 +865,17 @@ pub fn build_surface_stream(
         .collect::<Vec<_>>()
         .into_iter()
         .collect();
+    // (paved ground half light all over hundreds of square metres is tiled, not painted: a
+    // stop line's texture is as light, but on a strip of a few)
     let paint_masks: Vec<Option<Arc<raster::PaintMask>>> = files
         .iter()
-        .map(|f| f.as_ref().and_then(|p| decoded.get(p).cloned()))
+        .zip(&textures)
+        .map(|(f, (_, _, material))| {
+            let m = decoded.get(f.as_ref()?)?;
+            let i = *material as usize;
+            let tiled = class[i] == Surface::Paved as u8 && infos[i].area > 300.0 && m.share() > 0.4;
+            (!tiled).then(|| m.clone())
+        })
         .collect();
     let with_paint = decoded.len();
     for v in paints.values_mut() {

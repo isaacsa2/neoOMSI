@@ -17,6 +17,12 @@ fn materials_follow_the_paths_over_them() {
     // too little seen to judge: the name decides
     assert_eq!(classify("gehweg_platten", &cfg, [10.0, 10.0, 0.0, 0.0]), Some(Surface::Footway));
     assert_eq!(classify("wall_brick", &cfg, [400.0, 0.0, 0.0, 0.0]), None);
+    // a crossing is the carriageway with its stripes, named so or crossed by cars and people
+    assert_eq!(classify("crosswalk_asphalt", &cfg, [5.0, 0.0, 5.0, 0.0]), Some(Surface::Road));
+    assert_eq!(classify("xyz_02", &cfg, [500.0, 300.0, 500.0, 0.0]), Some(Surface::Road));
+    // a cycle path stays a path; a cycle lane painted on the carriageway is the road's
+    assert_eq!(classify("bikeline_u", &cfg, [400.0, 0.0, 300.0, 0.0]), Some(Surface::Footway));
+    assert_eq!(classify("bike_pik", &cfg, [1.0, 1.0, 0.0, 0.0]), Some(Surface::Road));
     let grass = ::texture::TextureCfg {
         terrain_mapping: true,
         ..Default::default()

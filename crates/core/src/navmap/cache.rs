@@ -14,7 +14,7 @@ use super::*;
 use crate::scene::World;
 
 /// Raise when what the build makes changes: older files are then built again
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 4;
 const MAGIC: &[u8; 8] = b"NOMSINAV";
 
 /// The files a build read, or looked for and did not find
@@ -56,12 +56,15 @@ fn stamp(p: &Path) -> (u64, u64) {
 
 /// The cache file of the map as it is opened: its folder, the content folders and archives
 /// files are looked for in, the chrono folders and the detail
+/// The file is named after the map and then after the rest: a new one replaces the map's
+/// others (see `save`).
 fn path_of(world: &World) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    FORMAT.hash(&mut h);
     world.root.hash(&mut h);
     world.map_dir.hash(&mut h);
+    let map = h.finish();
+    FORMAT.hash(&mut h);
     world.chrono_dirs.read().hash(&mut h);
     world.map_detail().hash(&mut h);
     ::mods::content_roots().hash(&mut h);
@@ -74,7 +77,7 @@ fn path_of(world: &World) -> Option<PathBuf> {
             .join(".neoomsi")
             .join("cache")
             .join("navmap")
-            .join(format!("{:016x}.bin", h.finish())),
+            .join(format!("{map:016x}-{:016x}.bin", h.finish())),
     )
 }
 
@@ -188,14 +191,42 @@ pub fn save(
         .and_then(|_| std::fs::write(&tmp, &w))
         .and_then(|_| std::fs::rename(&tmp, &path));
     match written {
-        Ok(()) => log::info!(
-            "navigator surfaces: kept in {} ({:.0} MB)",
-            path.display(),
-            w.len() as f64 / 1e6
-        ),
+        Ok(()) => {
+            log::info!(
+                "navigator surfaces: kept in {} ({:.0} MB)",
+                path.display(),
+                w.len() as f64 / 1e6
+            );
+            forget_others(&path);
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             log::warn!("navigator surfaces: not kept in {}: {e}", path.display());
+        }
+    }
+}
+
+/// Remove the map's other files beside `path` (an older format, other content folders or
+/// chrono days: tens of megabytes each, never read again until they come back) and those of
+/// the first format, named without the map.
+fn forget_others(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let Some((map, _)) = name.split_once('-') else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let other = e.file_name();
+        let Some(other) = other.to_str() else {
+            continue;
+        };
+        let ours = other.split_once('-').is_none_or(|(m, _)| m == map);
+        if ours && other != name && other.ends_with(".bin") {
+            let _ = std::fs::remove_file(e.path());
         }
     }
 }

@@ -120,6 +120,11 @@ impl PaintMask {
         bits.iter().any(|&b| b).then_some(PaintMask { w, h, bits })
     }
 
+    /// How much of the texture is paint.
+    pub(crate) fn share(&self) -> f32 {
+        self.bits.iter().filter(|&&b| b).count() as f32 / self.bits.len().max(1) as f32
+    }
+
     fn at(&self, u: f32, v: f32) -> bool {
         if !u.is_finite() || !v.is_finite() {
             return false;
