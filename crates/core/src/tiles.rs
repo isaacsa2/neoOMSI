@@ -351,6 +351,9 @@ impl MapIndex {
                         [first.pose.heading(), 0.0, 0.0],
                     ));
                 }
+                for (id, place) in attached_places(&tile, |id| part.objects.get(&id).map(|o| (o.1, o.2))) {
+                    part.objects.entry(id).or_insert(((*tx, *ty), place.0, place.1));
+                }
                 part.tiles_read = 1;
                 Some((part, rows, lights))
             })
@@ -482,6 +485,33 @@ const SPLINE_HALF_WIDTH: f64 = 50.0;
 
 /// The world rectangle a tile's square and its splines cover. A damaged length is bounded,
 /// so one bad record cannot make a tile a neighbour of the whole map.
+pub(crate) fn attached_places(
+    tile: &Tile,
+    place_of: impl Fn(i64) -> Option<(DVec3, [f64; 3])>,
+) -> Vec<(i64, (DVec3, [f64; 3]))> {
+    let mut placed: HashMap<i64, (DVec3, [f64; 3])> = HashMap::new();
+    let mut open: Vec<&::map::MapObject> = tile.attach_objects.iter().collect();
+    loop {
+        let before = open.len();
+        open.retain(|o| {
+            let Some(parent) = o.parent_id else {
+                return false;
+            };
+            match placed.get(&parent).copied().or_else(|| place_of(parent)) {
+                Some(p) => {
+                    placed.entry(o.id).or_insert(p);
+                    false
+                }
+                None => true,
+            }
+        });
+        if open.is_empty() || open.len() == before {
+            break;
+        }
+    }
+    placed.into_iter().collect()
+}
+
 fn spline_cover(tile: &Tile, origin: DVec2) -> [f64; 4] {
     let ts = tile_size();
     let mut c = [origin.x, origin.y, origin.x + ts, origin.y + ts];
@@ -2166,5 +2196,24 @@ mod tests {
             "{}",
             child.heading()
         );
+    }
+
+    #[test]
+    fn an_attached_stop_stands_where_its_parent_does() {
+        let attached = |id, parent| ::map::MapObject {
+            id,
+            parent_id: Some(parent),
+            ..Default::default()
+        };
+        // a stop (3) on a pole (2) on a shelter (1), written before the pole; and one whose
+        // parent is nowhere
+        let tile = Tile {
+            attach_objects: vec![attached(3, 2), attached(2, 1), attached(5, 99)],
+            ..Default::default()
+        };
+        let shelter = (DVec3::new(10.0, 20.0, 1.0), [90.0, 0.0, 0.0]);
+        let mut placed = attached_places(&tile, |id| (id == 1).then_some(shelter));
+        placed.sort_by_key(|p| p.0);
+        assert_eq!(placed, vec![(2, shelter), (3, shelter)]);
     }
 }

@@ -462,3 +462,126 @@ fn a_convex_hull_keeps_the_outline() {
     let h = convex_hull(pts);
     assert_eq!(h.len(), 4);
 }
+
+/// A navigator following `lanes` of `net`, joined to the route on lane `progress`, `s` m in
+fn following(net: Network, lanes: Vec<usize>, progress: usize, s: f32) -> Navigator {
+    let mut nav = Navigator::new(true, 1.0, "bottom-left");
+    nav.global = Some(std::sync::Arc::new(net));
+    nav.route = Route {
+        key: "trip".into(),
+        lanes,
+        complete: true,
+        progress,
+        s,
+        on_route: true,
+        joined: true,
+        ..Default::default()
+    };
+    nav
+}
+
+fn frame_at(bus: DVec3, heading: f64, stops: Vec<NavStop>) -> NavFrame<'static> {
+    NavFrame {
+        traffic: None,
+        bus,
+        heading,
+        speed_kmh: 30.0,
+        outside_temp: 20.0,
+        inside_temp: 20.0,
+        line: None,
+        terminus: None,
+        stops,
+        delay: None,
+        passengers: None,
+        stop_requested: false,
+        time: 0.0,
+        weekday: 0,
+        language: "en",
+        units: "metric",
+        screen: (1920.0, 1080.0),
+        ui_scale: 1.0,
+        follow_window: false,
+        dt: 0.02,
+    }
+}
+
+fn stop(name: &str, at: (f64, f64)) -> NavStop {
+    NavStop {
+        object_id: 1,
+        position: DVec3::new(at.0, at.1, 0.0),
+        name: name.into(),
+        arrival: 0.0,
+    }
+}
+
+/// A loop: north on lane 0 and 1, east, south, west, and north again on lane 5 right
+/// beside lane 0 (a route that comes back past where it started), on to lane 6
+fn loop_net() -> Network {
+    let lanes = vec![
+        straight((0.0, 0.0), (0.0, 50.0)),
+        straight((0.0, 50.0), (0.0, 100.0)),
+        straight((0.0, 100.0), (80.0, 100.0)),
+        straight((80.0, 100.0), (80.0, -40.0)),
+        straight((80.0, -40.0), (2.0, -40.0)),
+        straight((2.0, -40.0), (2.0, 60.0)),
+        straight((2.0, 60.0), (2.0, 200.0)),
+    ];
+    let mut net = Network {
+        lanes,
+        ..Default::default()
+    };
+    for (a, n) in [(0, vec![1]), (1, vec![2]), (2, vec![3]), (3, vec![4]), (4, vec![5]), (5, vec![6])] {
+        net.lanes[a].next = n;
+    }
+    net.build_grid();
+    net
+}
+
+#[test]
+fn following_the_route_does_not_jump_to_where_a_loop_comes_back_past() {
+    // the bus on lane 0, nearer the loop's last lane beside it than to its own
+    let mut nav = following(loop_net(), (0..7).collect(), 0, 20.0);
+    nav.follow(&frame_at(DVec3::new(1.6, 21.0, 0.0), 0.0, vec![stop("on the loop", (80.0, 30.0))]));
+    assert!(nav.route.on_route);
+    assert_eq!(nav.route.progress, 0, "the loop and its stop were skipped");
+    // driving on, it moves along the route as before
+    nav.follow(&frame_at(DVec3::new(0.0, 60.0, 0.0), 0.0, vec![stop("on the loop", (80.0, 30.0))]));
+    assert_eq!(nav.route.progress, 1);
+}
+
+#[test]
+fn a_way_back_joins_a_lane_driven_twice_where_the_route_first_reaches_it() {
+    // the route drives lane 1 twice: a loop 1 -> 2 -> 3 -> 1 -> 4
+    let lanes = vec![
+        straight((0.0, -50.0), (0.0, 0.0)),
+        straight((0.0, 0.0), (0.0, 100.0)),
+        straight((0.0, 100.0), (100.0, 100.0)),
+        straight((100.0, 100.0), (0.0, 0.0)),
+        straight((0.0, 100.0), (0.0, 200.0)),
+    ];
+    let mut net = Network {
+        lanes,
+        ..Default::default()
+    };
+    for (a, n) in [(0, vec![1]), (1, vec![2, 4]), (2, vec![3]), (3, vec![1])] {
+        net.lanes[a].next = n;
+    }
+    net.build_grid();
+    let route = [1usize, 2, 3, 1, 4];
+    let (path, join) = way_back(&net, DVec3::new(0.0, -30.0, 0.0), 0.0, &route, 6000.0)
+        .expect("a way");
+    assert_eq!(path, vec![0]);
+    assert_eq!(join, 0, "joined the second pass of lane 1: the loop is skipped");
+}
+
+#[test]
+fn a_stop_set_back_from_the_route_still_bounds_the_way_back() {
+    let net = loop_net();
+    let lanes: Vec<usize> = (0..7).collect();
+    // 30 m beside the loop's east side: no lane within 25 m, the east lane the nearest
+    assert_eq!(follow::stop_lane(&net, &lanes, 0, DVec3::new(110.0, 30.0, 0.0)), Some(3));
+    // near enough to a lane: the first lane passing it
+    assert_eq!(follow::stop_lane(&net, &lanes, 0, DVec3::new(10.0, 30.0, 0.0)), Some(0));
+    // far from everything: none
+    assert_eq!(follow::stop_lane(&net, &lanes, 0, DVec3::new(500.0, 500.0, 0.0)), None);
+}

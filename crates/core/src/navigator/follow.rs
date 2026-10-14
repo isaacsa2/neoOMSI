@@ -1,5 +1,29 @@
 use super::*;
 
+const FOLLOW_REACH: f64 = 40.0;
+const STOP_NEAR: f64 = 25.0;
+const STOP_FAR: f64 = 60.0;
+
+pub(super) fn stop_lane(net: &Network, lanes: &[usize], from: usize, at: DVec3) -> Option<usize> {
+    let range = from..lanes.len().min(from + 1500);
+    let dist = |k: usize| {
+        net.lanes
+            .get(lanes[k])
+            .and_then(|l| l.nearest_point(at))
+            .map(|p| p.1)
+    };
+    range
+        .clone()
+        .find(|&k| dist(k).is_some_and(|d| d < STOP_NEAR))
+        .or_else(|| {
+            range
+                .filter_map(|k| Some((k, dist(k)?)))
+                .filter(|x| x.1 < STOP_FAR)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|x| x.0)
+        })
+}
+
 pub(super) fn congestion_on(net: &Network, traffic: &Network, c: &HashMap<usize, f32>) -> HashMap<usize, f32> {
     let mut out = HashMap::new();
     for (&l, &v) in c {
@@ -59,15 +83,10 @@ impl Navigator {
             return;
         }
         r.note = (r.note - f.dt).max(0.0);
-        let stop_at = f.stops.first().and_then(|st| {
-            (r.progress..r.lanes.len().min(r.progress + 1500)).find(|&k| {
-                net.lanes
-                    .get(r.lanes[k])
-                    .and_then(|l| l.nearest_point(st.position))
-                    .map(|p| p.1 < 25.0)
-                    .unwrap_or(false)
-            })
-        });
+        let stop_at = f
+            .stops
+            .first()
+            .and_then(|st| stop_lane(net, &r.lanes, r.progress, st.position));
         let (from, to) = match (r.joined, stop_at) {
             (false, Some(k)) if r.approach => {
                 (r.progress.saturating_sub(3), (k + 2).min(r.lanes.len()))
@@ -82,10 +101,19 @@ impl Navigator {
             ),
         };
         let mut best: Option<(usize, f32, f64)> = None;
+        // how far along the route lane `k` begins, from the bus's place on it
+        let mut ahead = 0.0f64;
         for k in from..to {
+            if k > r.progress {
+                let before = net.lanes.get(r.lanes[k - 1]).map_or(0.0, |l| l.length() as f64);
+                ahead += if k - 1 == r.progress { before - r.s as f64 } else { before };
+            }
             let Some(l) = net.lanes.get(r.lanes[k]) else {
                 continue;
             };
+            if r.joined && ahead > FOLLOW_REACH + r.off_for as f64 * 25.0 {
+                break;
+            }
             let Some((s, d)) = l.nearest_point(f.bus) else {
                 continue;
             };

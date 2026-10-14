@@ -240,12 +240,10 @@ pub(crate) fn way_back(
         );
     }
     let start = start?;
-    let targets: HashMap<usize, usize> = ahead
-        .iter()
-        .take(120)
-        .enumerate()
-        .map(|(k, &l)| (l, k))
-        .collect();
+    let mut targets: HashMap<usize, usize> = HashMap::new();
+    for (k, &l) in ahead.iter().take(120).enumerate() {
+        targets.entry(l).or_insert(k);
+    }
     #[derive(PartialEq)]
     struct Node(f32, usize);
     impl Eq for Node {}

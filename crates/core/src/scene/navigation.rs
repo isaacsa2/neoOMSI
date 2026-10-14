@@ -395,6 +395,13 @@ impl World {
                         ));
                     }
                 }
+                // objects hung on others (a stop's pole on its shelter): at the parent's place
+                let own: HashMap<i64, DVec3> = positions.iter().copied().collect();
+                positions.extend(
+                    crate::tiles::attached_places(&tile, |id| own.get(&id).map(|p| (*p, [0.0; 3])))
+                        .into_iter()
+                        .map(|(id, (p, _))| (id, p)),
+                );
                 (lanes, positions, signs, roads, ways)
             })
             .collect();
@@ -409,6 +416,9 @@ impl World {
             signs.extend(s);
             roads.extend(r);
             carriageways.extend(w);
+        }
+        for (id, (p, _)) in self.object_positions.lock().iter() {
+            positions.entry(*id).or_insert(*p);
         }
         log::info!(
             "navigation map: {} roads without a path for cars, {} carriageways ({} of them without one)",
