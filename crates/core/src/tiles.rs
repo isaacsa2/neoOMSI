@@ -200,6 +200,9 @@ impl MapIndex {
         );
         let t0 = std::time::Instant::now();
         let signal_types = parking_lot::Mutex::new(HashMap::new());
+        // the attachment points of the types `[attachObj]` objects hang on, by file
+        let attach_points: parking_lot::Mutex<HashMap<String, std::sync::Arc<Vec<Mat4>>>> =
+            Default::default();
         // (per tile: the parents its children name a light of, and its objects' files - the
         // objects by id, the files once each - to tell afterwards which of those parents
         // are crossings with a light program)
@@ -351,8 +354,32 @@ impl MapIndex {
                         [first.pose.heading(), 0.0, 0.0],
                     ));
                 }
-                for (id, place) in attached_places(&tile, |id| part.objects.get(&id).map(|o| (o.1, o.2))) {
-                    part.objects.entry(id).or_insert(((*tx, *ty), place.0, place.1));
+                let attached = attached_places(
+                    &tile,
+                    |id| part.objects.get(&id).map(|o| map_pose(o.1, o.2)),
+                    |file, k| {
+                        let key = file.replace('/', "\\").to_ascii_lowercase();
+                        let points = attach_points
+                            .lock()
+                            .entry(key)
+                            .or_insert_with(|| {
+                                let path = ::mods::resolve_path(root, file);
+                                ::scenery::SceneryObject::load(&path)
+                                    .map(|sco| {
+                                        std::sync::Arc::new(
+                                            sco.attachments.iter().map(attachment_matrix).collect(),
+                                        )
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .clone();
+                        points.get(k).copied().unwrap_or(Mat4::IDENTITY)
+                    },
+                );
+                for (id, pose) in attached {
+                    part.objects
+                        .entry(id)
+                        .or_insert(((*tx, *ty), pose.pos, [pose.heading(), 0.0, 0.0]));
                 }
                 part.tiles_read = 1;
                 Some((part, rows, lights))
@@ -483,13 +510,27 @@ impl MapIndex {
 /// Room for a spline's width on either side of its centre line.
 const SPLINE_HALF_WIDTH: f64 = 50.0;
 
-/// The world rectangle a tile's square and its splines cover. A damaged length is bounded,
-/// so one bad record cannot make a tile a neighbour of the whole map.
+/// Where a tile's `[attachObj]` objects stand, from the tile file alone: on their parent's
+/// `[new_attachment]` point, as loading puts them there (`scene::stage`), through chains of
+/// attachments, in whatever order the file has them. `pose_of` gives the place of the tile's
+/// other objects and spline rows by id; `point` the matrix of a parent type's attachment
+/// point (file, index), the identity for a point it does not have - the parent's origin, as
+/// in the original. A stop hung on its shelter had no place until its tile was loaded, and
+/// the navigator left it out. Where the object has been placed, that place is the better one.
 pub(crate) fn attached_places(
     tile: &Tile,
-    place_of: impl Fn(i64) -> Option<(DVec3, [f64; 3])>,
-) -> Vec<(i64, (DVec3, [f64; 3]))> {
-    let mut placed: HashMap<i64, (DVec3, [f64; 3])> = HashMap::new();
+    pose_of: impl Fn(i64) -> Option<Pose>,
+    point: impl Fn(&str, usize) -> Mat4,
+) -> Vec<(i64, Pose)> {
+    // the files of the records an attachment may hang on
+    let files: HashMap<i64, &str> = tile
+        .objects
+        .iter()
+        .chain(&tile.attach_objects)
+        .map(|o| (o.id, o.file.as_str()))
+        .chain(tile.spline_attachments.iter().map(|a| (a.id, a.file.as_str())))
+        .collect();
+    let mut placed: HashMap<i64, Pose> = HashMap::new();
     let mut open: Vec<&::map::MapObject> = tile.attach_objects.iter().collect();
     loop {
         let before = open.len();
@@ -497,13 +538,17 @@ pub(crate) fn attached_places(
             let Some(parent) = o.parent_id else {
                 return false;
             };
-            match placed.get(&parent).copied().or_else(|| place_of(parent)) {
-                Some(p) => {
-                    placed.entry(o.id).or_insert(p);
-                    false
-                }
-                None => true,
-            }
+            let Some(pp) = placed.get(&parent).copied().or_else(|| pose_of(parent)) else {
+                return true;
+            };
+            let m = files
+                .get(&parent)
+                .map(|f| point(f, o.attach_index))
+                .unwrap_or(Mat4::IDENTITY);
+            placed
+                .entry(o.id)
+                .or_insert_with(|| pp.attached(&m, ::geometry::map_rotation(o.rot)));
+            false
         });
         if open.is_empty() || open.len() == before {
             break;
@@ -512,6 +557,16 @@ pub(crate) fn attached_places(
     placed.into_iter().collect()
 }
 
+/// The pose of a map object placed at `pos` turned by the tile's `rot` (heading, pitch, bank).
+pub(crate) fn map_pose(pos: DVec3, rot: [f64; 3]) -> Pose {
+    Pose {
+        pos,
+        rot: ::geometry::object_rotation(::geometry::map_rotation(rot)),
+    }
+}
+
+/// The world rectangle a tile's square and its splines cover. A damaged length is bounded,
+/// so one bad record cannot make a tile a neighbour of the whole map.
 fn spline_cover(tile: &Tile, origin: DVec2) -> [f64; 4] {
     let ts = tile_size();
     let mut c = [origin.x, origin.y, origin.x + ts, origin.y + ts];
@@ -2199,21 +2254,49 @@ mod tests {
     }
 
     #[test]
-    fn an_attached_stop_stands_where_its_parent_does() {
-        let attached = |id, parent| ::map::MapObject {
+    fn an_attached_stop_stands_on_its_parents_attachment_point() {
+        let attached = |id, parent, file: &str, index| ::map::MapObject {
             id,
+            file: file.into(),
             parent_id: Some(parent),
+            attach_index: index,
             ..Default::default()
         };
-        // a stop (3) on a pole (2) on a shelter (1), written before the pole; and one whose
-        // parent is nowhere
+        // a stop sign (3) on point 0 of a pole (2) on point 1 of a shelter (1), written before
+        // the pole; one on a point the pole does not have (4); one whose parent is nowhere (5)
         let tile = Tile {
-            attach_objects: vec![attached(3, 2), attached(2, 1), attached(5, 99)],
+            objects: vec![::map::MapObject {
+                id: 1,
+                file: "shelter.sco".into(),
+                ..Default::default()
+            }],
+            attach_objects: vec![
+                attached(3, 2, "sign.sco", 0),
+                attached(2, 1, "pole.sco", 1),
+                attached(4, 2, "sign.sco", 7),
+                attached(5, 99, "sign.sco", 0),
+            ],
             ..Default::default()
         };
-        let shelter = (DVec3::new(10.0, 20.0, 1.0), [90.0, 0.0, 0.0]);
-        let mut placed = attached_places(&tile, |id| (id == 1).then_some(shelter));
-        placed.sort_by_key(|p| p.0);
-        assert_eq!(placed, vec![(2, shelter), (3, shelter)]);
+        // the shelter faces east; its point 1 is 1.5 m to its right, the pole's point 0 2.5 m up
+        let shelter = map_pose(DVec3::new(10.0, 20.0, 1.0), [90.0, 0.0, 0.0]);
+        let point = |file: &str, k: usize| match (file, k) {
+            ("shelter.sco", 1) => Mat4::from_translation(Vec3::new(1.5, 0.0, 0.0)),
+            ("pole.sco", 0) => Mat4::from_translation(Vec3::new(0.0, 0.0, 2.5)),
+            _ => Mat4::IDENTITY,
+        };
+        let placed: HashMap<i64, Pose> =
+            attached_places(&tile, |id| (id == 1).then_some(shelter), point)
+                .into_iter()
+                .collect();
+        let at = |id: i64| placed.get(&id).map(|p| p.pos);
+        let near = |a: Option<DVec3>, b: DVec3| a.is_some_and(|a| (a - b).length() < 1e-4);
+        // facing east, the shelter's right is south
+        assert!(near(at(2), DVec3::new(10.0, 18.5, 1.0)), "{:?}", at(2));
+        assert!(near(at(3), DVec3::new(10.0, 18.5, 3.5)), "{:?}", at(3));
+        // a point the parent does not have: the parent's origin, as in the original
+        assert!(near(at(4), DVec3::new(10.0, 18.5, 1.0)), "{:?}", at(4));
+        assert_eq!(at(5), None);
+        assert!((placed[&3].heading() - 90.0).abs() < 1e-3);
     }
 }

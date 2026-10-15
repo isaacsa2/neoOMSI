@@ -271,7 +271,9 @@ fn object_floors(
 }
 
 /// Material statistics: area and the areas under street, pedestrian and rail paths.
-type Stats = HashMap<u32, [f64; 4]>;
+/// Per material: its area, the parts of it under street, pedestrian and rail paths, and the
+/// part of a street spline at the height of the street paths beside it (m²).
+type Stats = HashMap<u32, [f64; 5]>;
 
 /// Points spread over a triangle (barycentric weights), more for a bigger one.
 const SPREAD: [[f64; 3]; 7] = [
@@ -412,7 +414,16 @@ struct Gathered {
 
 impl Gathered {
     /// Count a face for its material and file it under every chunk it reaches
-    fn add(&mut self, w: [DVec3; 3], uv: [[f32; 2]; 3], ids: (u32, u32), ground: f64, ev: &Evidence) {
+    /// (`beside`: the face is part of a street spline, at the height of its street paths)
+    fn add(
+        &mut self,
+        w: [DVec3; 3],
+        uv: [[f32; 2]; 3],
+        ids: (u32, u32),
+        ground: f64,
+        ev: &Evidence,
+        beside: bool,
+    ) {
         let (material, texture) = ids;
         let area = (w[1] - w[0]).truncate().perp_dot((w[2] - w[0]).truncate()).abs() * 0.5;
         if area < 1e-4 {
@@ -425,8 +436,11 @@ impl Gathered {
         } else {
             7
         };
-        let st = self.stats.entry(material).or_insert([0.0; 4]);
+        let st = self.stats.entry(material).or_insert([0.0; 5]);
         st[0] += area;
+        if beside {
+            st[4] += area;
+        }
         for b in &SPREAD[..n] {
             let p = w[0] * b[0] + w[1] * b[1] + w[2] * b[2];
             let bits = ev.at(p);
@@ -470,16 +484,50 @@ impl Gathered {
     }
 }
 
-/// A pedestrian crossing painted on the carriageway, by its texture's name.
+/// How far beside the outermost street path of a spline a strip at its height still counts
+/// as part of the carriageway (m): a cycle lane, a gutter.
+const BESIDE_STREET: f32 = 4.5;
+/// How much higher or lower than a street path a strip beside it may lie and still be on the
+/// carriageway (m); a kerb is some 0.1 m or more.
+const STREET_LEVEL: f32 = 0.05;
+
+/// Whether every profile of a spline's texture `tex` lies at the height of its street paths
+/// (`streets`: their place across and height) and not further beside them than a lane:
+/// part of the carriageway, whatever is painted on it.
+pub(super) fn level_with_streets(
+    profiles: &[::scenery::SplineProfile],
+    tex: usize,
+    streets: &[(f32, f32)],
+) -> bool {
+    let Some(lo) = streets.iter().map(|s| s.0).reduce(f32::min) else {
+        return false;
+    };
+    let hi = streets.iter().map(|s| s.0).fold(lo, f32::max);
+    let mut points = profiles
+        .iter()
+        .filter(|p| p.texture == tex)
+        .flat_map(|p| &p.points)
+        .peekable();
+    points.peek().is_some()
+        && points.all(|q| {
+            (lo - BESIDE_STREET..=hi + BESIDE_STREET).contains(&q.x)
+                && streets.iter().any(|s| (q.z - s.1).abs() <= STREET_LEVEL)
+        })
+}
+
+/// A pedestrian crossing painted on the carriageway, by its texture's name. (Not anything
+/// "fussgaenger": a pedestrian zone or a footway is named so too, and is no road.)
 fn crossing(name: &str) -> bool {
-    ["crosswalk", "zebra", "ueberweg", "überweg", "uberweg", "fussgaenger", "fußgänger"]
+    ["crosswalk", "zebra", "ueberweg", "überweg", "uberweg"]
         .iter()
         .any(|w| name.contains(w))
 }
 
 /// A cycle lane or path, by its texture's name.
 fn cycle(name: &str) -> bool {
-    ["radweg", "fahrrad", "bike", "cycle"].iter().any(|w| name.contains(w))
+    ["radweg", "fahrrad", "radfahr", "radstreifen", "schutzstreifen", "bike", "cycle"]
+        .iter()
+        .any(|w| name.contains(w))
 }
 
 /// Words in a texture's name that say what it shows (the evidence of the paths comes first).
@@ -514,19 +562,21 @@ fn named(name: &str) -> Option<Surface> {
 
 /// The surface a material shows: what the paths over it say, where enough of it was seen,
 /// else what its `.cfg` and its name say.
-pub(super) fn classify(name: &str, cfg: &::texture::TextureCfg, st: [f64; 4]) -> Option<Surface> {
-    let [area, car, walk, rail] = st;
+pub(super) fn classify(name: &str, cfg: &::texture::TextureCfg, st: [f64; 5]) -> Option<Surface> {
+    let [area, car, walk, rail, level] = st;
     if cfg.terrain_mapping || cfg.surface == 4 {
         return Some(Surface::Green);
     }
-    let (car, walk, rail) = if area > 0.0 {
-        (car / area, walk / area, rail / area)
+    let (car, walk, rail, level) = if area > 0.0 {
+        (car / area, walk / area, rail / area, level / area)
     } else {
-        (0.0, 0.0, 0.0)
+        (0.0, 0.0, 0.0, 0.0)
     };
     // (a crossing is the carriageway's, with its stripes on it, not a footway across it;
-    // so is a cycle lane painted on it, its bicycles and lines read as the road's paint)
-    if crossing(name) || (cycle(name) && car >= 0.5) {
+    // so is a cycle lane painted on it, its bicycles and lines read as the road's paint:
+    // no car drives on it, but it lies at the height of the street beside it - a cycle
+    // track up on the kerb does not)
+    if crossing(name) || (cycle(name) && (car >= 0.5 || level >= 0.5)) {
         return Some(Surface::Road);
     }
     let by_name = named(name);
@@ -652,7 +702,7 @@ pub fn build_surface_stream(
                     continue;
                 }
                 let (cw, ch) = (ts / w as f64, ts / h as f64);
-                let st = g.stats.entry(material).or_insert([0.0; 4]);
+                let st = g.stats.entry(material).or_insert([0.0; 5]);
                 for j in 0..h {
                     for i in 0..w {
                         if alpha[j * w + i] < 128 {
@@ -695,10 +745,18 @@ pub fn build_surface_stream(
                 let curve = ::geometry::SplineCurve::from_map(sp, origin2);
                 let mesh = ::geometry::build_spline_mesh(&st.def, &curve, sp.mirror, origin);
                 let dirs = texture_dirs(&world.root, &st.dir);
+                let streets: Vec<(f32, f32)> = st
+                    .def
+                    .paths
+                    .iter()
+                    .filter(|p| p.kind == 0)
+                    .map(|p| (p.start[0], p.start[2]))
+                    .collect();
                 for &(first, count, slot) in &mesh.ranges {
                     let Some(tex) = st.def.textures.get(slot as usize) else {
                         continue;
                     };
+                    let level = level_with_streets(&st.def.profiles, slot as usize, &streets);
                     let mut id = None;
                     for t in mesh.indices[first as usize..(first + count) as usize].chunks_exact(3) {
                         let p = [
@@ -718,7 +776,7 @@ pub fn build_surface_stream(
                         let w = p.map(|v| origin + v.as_dvec3());
                         let mid = (w[0] + w[1] + w[2]) / 3.0;
                         let uv = [t[0], t[1], t[2]].map(|k| mesh.uvs[k as usize].to_array());
-                        g.add(w, uv, id, ground(mid), &ev);
+                        g.add(w, uv, id, ground(mid), &ev, level);
                     }
                 }
             }
@@ -750,7 +808,7 @@ pub fn build_surface_stream(
                     if !floors.streets && mid.z > under + 1.5 {
                         continue;
                     }
-                    g.add(w, *uv, *id, under, &ev);
+                    g.add(w, *uv, *id, under, &ev, false);
                 }
             }
             // the rows hung on splines: arrows on the road, parking bays, kerb pieces
@@ -774,7 +832,7 @@ pub fn build_surface_stream(
                         if !floors.streets && mid.z > under + 1.5 {
                             continue;
                         }
-                        g.add(w, *uv, *id, under, &ev);
+                        g.add(w, *uv, *id, under, &ev, false);
                     }
                 }
             }
@@ -789,8 +847,8 @@ pub fn build_surface_stream(
             paints.entry(k).or_default().push(p);
         }
         for (k, v) in g.stats {
-            let e = stats.entry(k).or_insert([0.0; 4]);
-            for i in 0..4 {
+            let e = stats.entry(k).or_insert([0.0; 5]);
+            for i in 0..5 {
                 e[i] += v[i];
             }
         }
@@ -811,7 +869,7 @@ pub fn build_surface_stream(
     let mut infos = Vec::with_capacity(names.len());
     let mut class = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
-        let st = stats.get(&(i as u32)).copied().unwrap_or([0.0; 4]);
+        let st = stats.get(&(i as u32)).copied().unwrap_or([0.0; 5]);
         let s = classify(name, &sources[i].cfg, st);
         class.push(s.map(|s| s as u8).unwrap_or(0));
         let a = st[0].max(1e-9);
@@ -877,7 +935,7 @@ pub fn build_surface_stream(
             (!tiled).then(|| m.clone())
         })
         .collect();
-    let with_paint = decoded.len();
+    let with_paint = paint_masks.iter().filter(|m| m.is_some()).count();
     for v in paints.values_mut() {
         v.sort_by_key(|p| std::cmp::Reverse(p.layer));
     }

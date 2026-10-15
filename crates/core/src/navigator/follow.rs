@@ -1,9 +1,18 @@
 use super::*;
 
+/// How far along the route ahead of where it is the bus may be found from one frame to the
+/// next (m), while it follows the route: a later pass of a route that loops back past here
+/// lies further on, and taking it skipped the loop and its stops (#322).
 const FOLLOW_REACH: f64 = 40.0;
+/// A stop belongs to the first route lane that passes this near it (m) ...
 const STOP_NEAR: f64 = 25.0;
+/// ... else to the route lane nearest to it, up to this far (a stop set back in a bay, a
+/// stop the timetable places only roughly).
 const STOP_FAR: f64 = 60.0;
 
+/// The route lane (index into `lanes`, from `from` on) at which the stop at `at` is served:
+/// where the way search must lead back to at the latest. Without one the way back may join
+/// the route anywhere ahead, past the stop.
 pub(super) fn stop_lane(net: &Network, lanes: &[usize], from: usize, at: DVec3) -> Option<usize> {
     let range = from..lanes.len().min(from + 1500);
     let dist = |k: usize| {

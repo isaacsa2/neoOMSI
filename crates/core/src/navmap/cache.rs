@@ -14,7 +14,7 @@ use super::*;
 use crate::scene::World;
 
 /// Raise when what the build makes changes: older files are then built again
-const FORMAT: u32 = 4;
+const FORMAT: u32 = 5;
 const MAGIC: &[u8; 8] = b"NOMSINAV";
 
 /// The files a build read, or looked for and did not find
@@ -55,7 +55,8 @@ fn stamp(p: &Path) -> (u64, u64) {
 }
 
 /// The cache file of the map as it is opened: its folder, the content folders and archives
-/// files are looked for in, the chrono folders and the detail
+/// files are looked for in, the chrono folders and the detail.
+///
 /// The file is named after the map and then after the rest: a new one replaces the map's
 /// others (see `save`).
 fn path_of(world: &World) -> Option<PathBuf> {

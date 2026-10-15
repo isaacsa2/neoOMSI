@@ -6,28 +6,36 @@ use glam::DVec3;
 fn materials_follow_the_paths_over_them() {
     let cfg = ::texture::TextureCfg::default();
     // whatever it is called: the street paths run over it
-    assert_eq!(classify("asphalt1", &cfg, [500.0, 300.0, 0.0, 0.0]), Some(Surface::Road));
-    assert_eq!(classify("xyz_01", &cfg, [500.0, 300.0, 0.0, 0.0]), Some(Surface::Road));
+    assert_eq!(classify("asphalt1", &cfg, [500.0, 300.0, 0.0, 0.0, 0.0]), Some(Surface::Road));
+    assert_eq!(classify("xyz_01", &cfg, [500.0, 300.0, 0.0, 0.0, 0.0]), Some(Surface::Road));
     // a pavement the pedestrians walk on, a track bed under the rails
-    assert_eq!(classify("str_side1", &cfg, [400.0, 0.0, 200.0, 0.0]), Some(Surface::Footway));
-    assert_eq!(classify("schotter", &cfg, [400.0, 0.0, 0.0, 300.0]), Some(Surface::Track));
-    assert_eq!(classify("schotter", &cfg, [400.0, 0.0, 0.0, 10.0]), None);
+    assert_eq!(classify("str_side1", &cfg, [400.0, 0.0, 200.0, 0.0, 0.0]), Some(Surface::Footway));
+    assert_eq!(classify("schotter", &cfg, [400.0, 0.0, 0.0, 300.0, 0.0]), Some(Surface::Track));
+    assert_eq!(classify("schotter", &cfg, [400.0, 0.0, 0.0, 10.0, 0.0]), None);
     // asphalt no car drives on is still paved ground
-    assert_eq!(classify("str_asphdrk", &cfg, [400.0, 0.0, 0.0, 0.0]), Some(Surface::Paved));
+    assert_eq!(classify("str_asphdrk", &cfg, [400.0, 0.0, 0.0, 0.0, 0.0]), Some(Surface::Paved));
     // too little seen to judge: the name decides
-    assert_eq!(classify("gehweg_platten", &cfg, [10.0, 10.0, 0.0, 0.0]), Some(Surface::Footway));
-    assert_eq!(classify("wall_brick", &cfg, [400.0, 0.0, 0.0, 0.0]), None);
+    assert_eq!(classify("gehweg_platten", &cfg, [10.0, 10.0, 0.0, 0.0, 0.0]), Some(Surface::Footway));
+    assert_eq!(classify("wall_brick", &cfg, [400.0, 0.0, 0.0, 0.0, 0.0]), None);
     // a crossing is the carriageway with its stripes, named so or crossed by cars and people
-    assert_eq!(classify("crosswalk_asphalt", &cfg, [5.0, 0.0, 5.0, 0.0]), Some(Surface::Road));
-    assert_eq!(classify("xyz_02", &cfg, [500.0, 300.0, 500.0, 0.0]), Some(Surface::Road));
+    assert_eq!(classify("crosswalk_asphalt", &cfg, [5.0, 0.0, 5.0, 0.0, 0.0]), Some(Surface::Road));
+    assert_eq!(classify("fussgaengerueberweg", &cfg, [5.0, 0.0, 5.0, 0.0, 0.0]), Some(Surface::Road));
+    // a pedestrian zone is no crossing, whatever its name begins with
+    assert_ne!(classify("fussgaengerzone_pflaster", &cfg, [400.0, 0.0, 300.0, 0.0, 0.0]), Some(Surface::Road));
+    assert_eq!(classify("xyz_02", &cfg, [500.0, 300.0, 500.0, 0.0, 0.0]), Some(Surface::Road));
     // a cycle path stays a path; a cycle lane painted on the carriageway is the road's
-    assert_eq!(classify("bikeline_u", &cfg, [400.0, 0.0, 300.0, 0.0]), Some(Surface::Footway));
-    assert_eq!(classify("bike_pik", &cfg, [1.0, 1.0, 0.0, 0.0]), Some(Surface::Road));
+    assert_eq!(classify("bikeline_u", &cfg, [400.0, 0.0, 300.0, 0.0, 0.0]), Some(Surface::Footway));
+    assert_eq!(classify("bike_pik", &cfg, [1.0, 1.0, 0.0, 0.0, 0.0]), Some(Surface::Road));
+    // no car drives on a cycle lane, but it lies at the street's height beside it
+    assert_eq!(classify("radfahrstreifen_rot", &cfg, [400.0, 0.0, 0.0, 0.0, 400.0]), Some(Surface::Road));
+    assert_eq!(classify("bikelane", &cfg, [400.0, 0.0, 0.0, 0.0, 400.0]), Some(Surface::Road));
+    // up on the kerb it is a cycle track, a path
+    assert_eq!(classify("bikelane", &cfg, [400.0, 0.0, 0.0, 0.0, 0.0]), Some(Surface::Footway));
     let grass = ::texture::TextureCfg {
         terrain_mapping: true,
         ..Default::default()
     };
-    assert_eq!(classify("verge", &grass, [400.0, 0.0, 0.0, 0.0]), Some(Surface::Green));
+    assert_eq!(classify("verge", &grass, [400.0, 0.0, 0.0, 0.0, 0.0]), Some(Surface::Green));
 }
 
 /// Draw the surfaces around a place of a real map into a PNG, from above, for a look at
@@ -210,4 +218,27 @@ fn draw(map: &SurfaceMap, lanes: &[::simulation::traffic::Lane], c: DVec2, radiu
     }
     let _ = DVec3::ZERO;
     img.save(path).unwrap();
+}
+
+#[test]
+fn a_strip_at_the_height_of_the_street_paths_beside_them_is_carriageway() {
+    use ::scenery::{SplineProfile, SplineProfilePoint};
+    let strip = |texture, x: [f32; 2], z: f32| SplineProfile {
+        texture,
+        points: x.iter().map(|&x| SplineProfilePoint { x, z, ..Default::default() }).collect(),
+    };
+    let profiles = vec![
+        strip(0, [-3.5, 3.5], 0.0),  // the lanes
+        strip(1, [3.5, 5.0], 0.0),   // a cycle lane painted beside them
+        strip(2, [5.0, 6.5], 0.15),  // a cycle track up on the kerb
+        strip(3, [12.0, 14.0], 0.0), // a strip far off the carriageway
+    ];
+    let streets = [(-1.75, 0.0), (1.75, 0.0)];
+    assert!(level_with_streets(&profiles, 0, &streets));
+    assert!(level_with_streets(&profiles, 1, &streets));
+    assert!(!level_with_streets(&profiles, 2, &streets));
+    assert!(!level_with_streets(&profiles, 3, &streets));
+    // a texture no profile uses, a spline without a street path
+    assert!(!level_with_streets(&profiles, 9, &streets));
+    assert!(!level_with_streets(&profiles, 1, &[]));
 }

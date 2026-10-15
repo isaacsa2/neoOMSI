@@ -240,6 +240,7 @@ impl World {
             Vec<(DVec3, f64, String)>,
             Vec<(Vec<DVec3>, f32)>,
             Vec<NavCarriageway>,
+            Vec<(i64, DVec3)>,
         )> = tiles
             .par_iter()
             .map(|(_, tx, ty, path)| {
@@ -252,7 +253,7 @@ impl World {
                 let Some(tile) =
                     crate::tiles::read_tile(path, &self.chrono_dirs.read(), self.map_detail)
                 else {
-                    return (lanes, positions, signs, roads, ways);
+                    return (lanes, positions, signs, roads, ways, Vec::new());
                 };
                 let origin2 = DVec2::new(tx as f64 * tile_size(), ty as f64 * tile_size());
                 let terrain = Terrain::load(&tile_companion(&path, ".terrain"))
@@ -395,14 +396,26 @@ impl World {
                         ));
                     }
                 }
-                // objects hung on others (a stop's pole on its shelter): at the parent's place
+                // objects hung on others (a stop's pole on its shelter): on the parent's
+                // attachment point (kept apart: where one has been placed, that place wins)
+                let rot: HashMap<i64, [f64; 3]> = tile.objects.iter().map(|o| (o.id, o.rot)).collect();
                 let own: HashMap<i64, DVec3> = positions.iter().copied().collect();
-                positions.extend(
-                    crate::tiles::attached_places(&tile, |id| own.get(&id).map(|p| (*p, [0.0; 3])))
-                        .into_iter()
-                        .map(|(id, (p, _))| (id, p)),
-                );
-                (lanes, positions, signs, roads, ways)
+                let attached = crate::tiles::attached_places(
+                    &tile,
+                    |id| {
+                        let p = *own.get(&id)?;
+                        Some(crate::tiles::map_pose(p, rot.get(&id).copied().unwrap_or_default()))
+                    },
+                    |file, k| {
+                        sco_of(file)
+                            .and_then(|sco| sco.attachments.get(k).map(crate::tiles::attachment_matrix))
+                            .unwrap_or(glam::Mat4::IDENTITY)
+                    },
+                )
+                .into_iter()
+                .map(|(id, pose)| (id, pose.pos))
+                .collect();
+                (lanes, positions, signs, roads, ways, attached)
             })
             .collect();
         let mut lanes = Vec::new();
@@ -410,15 +423,24 @@ impl World {
         let mut signs = Vec::new();
         let mut roads = Vec::new();
         let mut carriageways = Vec::new();
-        for (l, p, s, r, w) in parts {
+        let mut attached = Vec::new();
+        for (l, p, s, r, w, a) in parts {
+            attached.extend(a);
             lanes.extend(l);
             positions.extend(p);
             signs.extend(s);
             roads.extend(r);
             carriageways.extend(w);
         }
+        // objects the map index places that the tiles' own objects are not: a stop put on a
+        // road (`[splineAttachement]`), and an attached one as it was placed once its tile
+        // was loaded - without a place the navigator leaves the stop out
         for (id, (p, _)) in self.object_positions.lock().iter() {
             positions.entry(*id).or_insert(*p);
+        }
+        // (an attached object nobody placed yet: on its parent's point, worked out above)
+        for (id, p) in attached {
+            positions.entry(id).or_insert(p);
         }
         log::info!(
             "navigation map: {} roads without a path for cars, {} carriageways ({} of them without one)",
