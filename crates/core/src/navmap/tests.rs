@@ -242,3 +242,64 @@ fn a_strip_at_the_height_of_the_street_paths_beside_them_is_carriageway() {
     assert!(!level_with_streets(&profiles, 9, &streets));
     assert!(!level_with_streets(&profiles, 1, &[]));
 }
+
+/// A flat square face pair of `size` m at `at`, `above` m over the ground there.
+fn square(at: (f64, f64, f64), size: f64, above: f64) -> Vec<PieceFace> {
+    let (x, y, z) = at;
+    let p = |dx: f64, dy: f64| DVec3::new(x + dx, y + dy, z);
+    [[p(0.0, 0.0), p(size, 0.0), p(size, size)], [p(0.0, 0.0), p(size, size), p(0.0, size)]]
+        .into_iter()
+        .map(|w| PieceFace {
+            w,
+            uv: [[0.0; 2]; 3],
+            ids: (0, 0),
+            beside: false,
+            above,
+        })
+        .collect()
+}
+
+#[test]
+fn a_deck_lies_on_one_level_however_its_faces_straddle_the_gap() {
+    // a bridge deck some 4 m over a canal's bed: its faces just below and just above the gap
+    let mut deck = square((0.0, 0.0, 0.0), 10.0, 3.9);
+    deck.extend(square((10.0, 0.0, 0.0), 10.0, 4.3));
+    deck.extend(square((20.0, 0.0, 0.0), 10.0, 4.2));
+    assert_eq!(piece_level(&deck), 1);
+    assert_eq!(piece_level(&square((0.0, 0.0, 0.0), 10.0, 0.1)), 0);
+    assert_eq!(piece_level(&square((0.0, 0.0, 0.0), 10.0, -6.0)), -1);
+    assert_eq!(piece_level(&[]), 0);
+}
+
+#[test]
+fn a_raised_floor_is_kept_where_paths_run_over_it_and_a_roof_is_not() {
+    use ::simulation::traffic::{LaneBuilder, LaneKind};
+    // a street across a bridge object 4 m over the ground, at z 4
+    let road = LaneBuilder::polyline(
+        vec![DVec3::new(-10.0, 5.0, 4.0), DVec3::new(30.0, 5.0, 4.0)],
+        LaneKind::Street,
+        3.0,
+    );
+    let ev = Evidence::new(&[road]);
+    // the deck the street runs over, its pavement beside it (no path on it), its roof (a
+    // canopy 6 m higher) and its foot on the ground
+    let deck = || {
+        let mut v = square((0.0, 0.0, 4.0), 10.0, 4.0);
+        v.extend(square((0.0, 10.0, 4.2), 3.0, 4.2));
+        v.extend(square((0.0, 0.0, 10.0), 10.0, 10.0));
+        v.extend(square((40.0, 0.0, 0.0), 5.0, 0.0));
+        v
+    };
+    let mut piece = deck();
+    keep_floors(&mut piece, false, &ev);
+    let zs: Vec<f64> = piece.iter().map(|f| f.w[0].z).collect();
+    assert_eq!(zs, vec![4.0, 4.0, 4.2, 4.2, 0.0, 0.0], "the deck, its pavement and the foot");
+    // no path over it: a storey or a roof, only the foot stays
+    let mut piece = deck();
+    keep_floors(&mut piece, false, &Evidence::new(&[]));
+    assert!(piece.iter().all(|f| f.above <= 1.5));
+    // an object with a street of its own keeps everything
+    let mut piece = deck();
+    keep_floors(&mut piece, true, &Evidence::new(&[]));
+    assert_eq!(piece.len(), 8);
+}

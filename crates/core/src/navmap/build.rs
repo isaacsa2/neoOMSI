@@ -119,7 +119,7 @@ impl Materials {
 }
 
 /// Where the paths run: segments of the street, pedestrian and rail paths in a grid.
-struct Evidence {
+pub(super) struct Evidence {
     segs: Vec<(DVec3, DVec3, f32, u8)>,
     grid: HashMap<(i32, i32), Vec<u32>>,
 }
@@ -130,7 +130,7 @@ const WALK: u8 = 2;
 const RAIL: u8 = 4;
 
 impl Evidence {
-    fn new(lanes: &[Lane]) -> Evidence {
+    pub(super) fn new(lanes: &[Lane]) -> Evidence {
         let mut ev = Evidence {
             segs: Vec::new(),
             grid: HashMap::new(),
@@ -412,15 +412,84 @@ struct Gathered {
     paints: Vec<((i32, i32), Paint)>,
 }
 
+/// How high above the ground an object's floor may lie and still be on the ground (m).
+const RAISED: f64 = 1.5;
+
+/// How far above or below a raised floor that paths run over another one may lie and be
+/// part of the same deck (m): its pavements, its median, its slope.
+const DECK: f64 = 1.0;
+
+/// Of an object's floors, those that are ground to drive or walk on. One above the ground is
+/// a storey or a roof - unless the object carries a street of its own (`streets`; an
+/// underpass below it is kept, however deep), or it is a deck that paths run over, and the
+/// floors at its height: a bridge whose road is a spline of its own (Berlin's Schlossbrücke
+/// stood 4 m over the canal's bed and was dropped as a roof - the bridge showed its markings
+/// over nothing). A station's roof high over its platforms stays out.
+pub(super) fn keep_floors(piece: &mut Vec<PieceFace>, streets: bool, ev: &Evidence) {
+    if streets {
+        return;
+    }
+    let mid = |f: &PieceFace| (f.w[0] + f.w[1] + f.w[2]) / 3.0;
+    let decks: Vec<f64> = piece
+        .iter()
+        .filter(|f| f.above > RAISED && ev.at(mid(f)) & (CAR | WALK) != 0)
+        .map(|f| mid(f).z)
+        .collect();
+    piece.retain(|f| f.above <= RAISED || decks.iter().any(|z| (mid(f).z - z).abs() <= DECK));
+}
+
+/// A face of a piece (a spline, an object) on its way into [`Gathered`]: its corners, texture
+/// coordinates, material and texture, whether it lies level with a street beside it, and how
+/// high above the ground its middle is (m).
+pub(super) struct PieceFace {
+    pub(super) w: [DVec3; 3],
+    pub(super) uv: [[f32; 2]; 3],
+    pub(super) ids: (u32, u32),
+    pub(super) beside: bool,
+    pub(super) above: f64,
+}
+
+/// The level of a piece (see [`Gathered::add_piece`]): how high it lies above the ground
+/// over all its faces, by their area.
+pub(super) fn piece_level(faces: &[PieceFace]) -> i8 {
+    let (mut sum, mut total) = (0.0, 0.0);
+    for f in faces {
+        let a = (f.w[1] - f.w[0]).truncate().perp_dot((f.w[2] - f.w[0]).truncate()).abs();
+        sum += f.above * a;
+        total += a;
+    }
+    let above = if total > 0.0 { sum / total } else { 0.0 };
+    if above > LEVEL_GAP {
+        1
+    } else if above < -LEVEL_GAP {
+        -1
+    } else {
+        0
+    }
+}
+
 impl Gathered {
+    /// Add the faces of one piece - a spline, an object - all on one level: how high the
+    /// piece lies above the ground over all its faces. Taken face by face, a bridge deck some
+    /// 4 m over a canal's bed (Berlin's Schlossbrücke) fell to either side of `LEVEL_GAP`
+    /// triangle by triangle, both levels broke into shreds too small to draw, and the bridge
+    /// showed its markings over nothing.
+    fn add_piece(&mut self, faces: &mut Vec<PieceFace>, ev: &Evidence) {
+        let level = piece_level(faces);
+        for f in faces.drain(..) {
+            self.add(f.w, f.uv, f.ids, level, ev, f.beside);
+        }
+    }
+
     /// Count a face for its material and file it under every chunk it reaches
-    /// (`beside`: the face is part of a street spline, at the height of its street paths)
+    /// (`beside`: the face is part of a street spline, at the height of its street paths;
+    /// `level`: of the piece it belongs to, see [`Gathered::add_piece`])
     fn add(
         &mut self,
         w: [DVec3; 3],
         uv: [[f32; 2]; 3],
         ids: (u32, u32),
-        ground: f64,
+        level: i8,
         ev: &Evidence,
         beside: bool,
     ) {
@@ -455,14 +524,6 @@ impl Gathered {
                 st[3] += share;
             }
         }
-        let mid = (w[0] + w[1] + w[2]) / 3.0;
-        let level = if mid.z > ground + LEVEL_GAP {
-            1
-        } else if mid.z < ground - LEVEL_GAP {
-            -1
-        } else {
-            0
-        };
         let m = MARGIN as f64 * CELL;
         let lo = w[0].truncate().min(w[1].truncate()).min(w[2].truncate()) - DVec2::splat(m);
         let hi = w[0].truncate().max(w[1].truncate()).max(w[2].truncate()) + DVec2::splat(m);
@@ -745,6 +806,7 @@ pub fn build_surface_stream(
                 let curve = ::geometry::SplineCurve::from_map(sp, origin2);
                 let mesh = ::geometry::build_spline_mesh(&st.def, &curve, sp.mirror, origin);
                 let dirs = texture_dirs(&world.root, &st.dir);
+                let mut piece = Vec::new();
                 let streets: Vec<(f32, f32)> = st
                     .def
                     .paths
@@ -756,7 +818,7 @@ pub fn build_surface_stream(
                     let Some(tex) = st.def.textures.get(slot as usize) else {
                         continue;
                     };
-                    let level = level_with_streets(&st.def.profiles, slot as usize, &streets);
+                    let beside = level_with_streets(&st.def.profiles, slot as usize, &streets);
                     let mut id = None;
                     for t in mesh.indices[first as usize..(first + count) as usize].chunks_exact(3) {
                         let p = [
@@ -776,9 +838,16 @@ pub fn build_surface_stream(
                         let w = p.map(|v| origin + v.as_dvec3());
                         let mid = (w[0] + w[1] + w[2]) / 3.0;
                         let uv = [t[0], t[1], t[2]].map(|k| mesh.uvs[k as usize].to_array());
-                        g.add(w, uv, id, ground(mid), &ev, level);
+                        piece.push(PieceFace {
+                            w,
+                            uv,
+                            ids: id,
+                            beside,
+                            above: mid.z - ground(mid),
+                        });
                     }
                 }
+                g.add_piece(&mut piece, &ev);
             }
             for o in &tile.objects {
                 if o.file.trim().is_empty() {
@@ -795,6 +864,7 @@ pub fn build_surface_stream(
                     if floors.absolute { o.pos[2] } else { o.pos[2] + foot },
                 );
                 let rot: Mat4 = ::geometry::object_rotation(::geometry::map_rotation(o.rot));
+                let mut piece = Vec::new();
                 for (p, uv, id) in &floors.faces {
                     let w = p.map(|v| pos + rot.transform_point3(v).as_dvec3());
                     let n = (w[1] - w[0]).cross(w[2] - w[0]);
@@ -803,13 +873,16 @@ pub fn build_surface_stream(
                     }
                     let mid = (w[0] + w[1] + w[2]) / 3.0;
                     let under = ground(mid);
-                    // a floor above the ground is a storey or a roof (an underpass below a
-                    // bridge object is kept, however deep)
-                    if !floors.streets && mid.z > under + 1.5 {
-                        continue;
-                    }
-                    g.add(w, *uv, *id, under, &ev, false);
+                    piece.push(PieceFace {
+                        w,
+                        uv: *uv,
+                        ids: *id,
+                        beside: false,
+                        above: mid.z - under,
+                    });
                 }
+                keep_floors(&mut piece, floors.streets, &ev);
+                g.add_piece(&mut piece, &ev);
             }
             // the rows hung on splines: arrows on the road, parking bays, kerb pieces
             for a in &tile.spline_attachments {
@@ -819,6 +892,7 @@ pub fn build_surface_stream(
                 let Some(floors) = object_of(&a.file) else {
                     continue;
                 };
+                let mut piece = Vec::new();
                 for (_, ro) in crate::tiles::tile_row_objects(a, &tile.splines, origin2, None) {
                     let (pos, rot) = (ro.pose.pos, ro.pose.rot);
                     for (p, uv, id) in &floors.faces {
@@ -829,11 +903,16 @@ pub fn build_surface_stream(
                         }
                         let mid = (w[0] + w[1] + w[2]) / 3.0;
                         let under = ground(mid);
-                        if !floors.streets && mid.z > under + 1.5 {
-                            continue;
-                        }
-                        g.add(w, *uv, *id, under, &ev, false);
+                        piece.push(PieceFace {
+                            w,
+                            uv: *uv,
+                            ids: *id,
+                            beside: false,
+                            above: mid.z - under,
+                        });
                     }
+                    keep_floors(&mut piece, floors.streets, &ev);
+                    g.add_piece(&mut piece, &ev);
                 }
             }
             g

@@ -14,7 +14,7 @@ use super::*;
 use crate::scene::World;
 
 /// Raise when what the build makes changes: older files are then built again
-const FORMAT: u32 = 5;
+const FORMAT: u32 = 6;
 const MAGIC: &[u8; 8] = b"NOMSINAV";
 
 /// The files a build read, or looked for and did not find
