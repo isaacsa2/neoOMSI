@@ -295,9 +295,6 @@ fn object_floors(
     let path = ::mods::resolve_path(&world.root, file);
     deps.add(&path);
     let sco = ::scenery::SceneryObject::load(&path).ok()?;
-    if sco.only_editor {
-        return None;
-    }
     let billboard = sco.tree.as_ref().map(|(_, min_h, max_h, min_r, max_r)| {
         let mid = |a: f32, b: f32, or: f32| if a + b > 0.0 { (a + b) * 0.5 } else { or };
         Crown::Billboard(mid(*min_h, *max_h, 10.0), mid(*min_r, *max_r, 1.0))
@@ -310,6 +307,9 @@ fn object_floors(
             roof: Vec::new(),
             crown: billboard,
         });
+    }
+    if sco.only_editor {
+        return None;
     }
     let sco_dir = path.parent()?.to_path_buf();
     let (model, model_dir) = match &sco.model_file {
@@ -324,6 +324,8 @@ fn object_floors(
         return None;
     }
     let streets = sco.paths.iter().any(|p| p.kind == 0);
+    // (a railway bridge, a platform: its deck carries the tracks, it is no house)
+    let rails = sco.paths.iter().any(|p| p.kind == 2);
     let dirs = texture_dirs(&world.root, &model_dir);
     let mut faces = Vec::new();
     // every face, for the roof and a tree's crown
@@ -373,7 +375,7 @@ fn object_floors(
         }
     }
     // a tree with a mesh: its crown as wide as the mesh; anything else with a roof high
-    // enough is a building - not one that carries a street or is a surface itself
+    // enough is a building - not one that carries a street or tracks or is a surface itself
     let (roof, crown) = if tree_named(&path) {
         let (lo, hi) = all.iter().flatten().fold(
             (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)),
@@ -381,7 +383,7 @@ fn object_floors(
         );
         let r = ((hi - lo).max_element() * 0.5).clamp(0.5, 12.0);
         (Vec::new(), (!all.is_empty()).then_some(Crown::Mesh(r)))
-    } else if streets || sco.surface {
+    } else if streets || rails || sco.surface {
         (Vec::new(), None)
     } else {
         (roof_of(&all), None)
@@ -606,25 +608,22 @@ const RAISED: f64 = 1.5;
 /// part of the same deck (m): its pavements, its median, its slope.
 const DECK: f64 = 1.0;
 
-/// Of an object's floors, those that are ground to drive or walk on. One above the ground is
-/// a storey or a roof - unless the object carries a street of its own (`streets`; an
-/// underpass below it is kept, however deep), or it is a deck that paths run over, and the
-/// floors at its height: a bridge whose road is a spline of its own (Berlin's Schlossbrücke
-/// stood 4 m over the canal's bed and was dropped as a roof - the bridge showed its markings
-/// over nothing). A station's roof high over its platforms stays out. Whether it is such a
-/// deck: then it is no building either.
 pub(super) fn keep_floors(piece: &mut Vec<PieceFace>, streets: bool, ev: &Evidence) -> bool {
     if streets {
         return false;
     }
     let mid = |f: &PieceFace| (f.w[0] + f.w[1] + f.w[2]) / 3.0;
-    let decks: Vec<f64> = piece
-        .iter()
-        .filter(|f| f.above > RAISED && ev.at(mid(f)) & (CAR | WALK) != 0)
-        .map(|f| mid(f).z)
-        .collect();
+    let mut carried = false;
+    let mut decks: Vec<f64> = Vec::new();
+    for f in piece.iter().filter(|f| f.above > RAISED) {
+        let on = ev.at(mid(f));
+        carried |= on & (CAR | WALK | RAIL) != 0;
+        if on & (CAR | WALK) != 0 {
+            decks.push(mid(f).z);
+        }
+    }
     piece.retain(|f| f.above <= RAISED || decks.iter().any(|z| (mid(f).z - z).abs() <= DECK));
-    !decks.is_empty()
+    carried
 }
 
 /// The radius of a tree's crown (m): a billboard as the map sizes the tree (`extra`: its
@@ -656,23 +655,42 @@ pub(super) struct PieceFace {
     pub(super) above: f64,
 }
 
-/// The level of a piece (see [`Gathered::add_piece`]): how high it lies above the ground
-/// over all its faces, by their area.
-pub(super) fn piece_level(faces: &[PieceFace]) -> i8 {
-    let (mut sum, mut total) = (0.0, 0.0);
-    for f in faces {
-        let a = (f.w[1] - f.w[0]).truncate().perp_dot((f.w[2] - f.w[0]).truncate()).abs();
-        sum += f.above * a;
-        total += a;
+/// How far apart in height (m) two of a piece's faces may lie and still be one surface
+/// (see [`piece_levels`]): a deck's slope and camber, not a deck over the ground
+const BAND_GAP: f64 = 1.5;
+
+pub(super) fn piece_levels(faces: &[PieceFace]) -> Vec<i8> {
+    let mut order: Vec<usize> = (0..faces.len()).collect();
+    order.sort_by(|&a, &b| faces[a].above.total_cmp(&faces[b].above));
+    let area = |f: &PieceFace| (f.w[1] - f.w[0]).truncate().perp_dot((f.w[2] - f.w[0]).truncate()).abs();
+    let mut levels = vec![0i8; faces.len()];
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && faces[order[end]].above - faces[order[end - 1]].above <= BAND_GAP {
+            end += 1;
+        }
+        let band = &order[start..end];
+        let (mut sum, mut total) = (0.0, 0.0);
+        for &k in band {
+            let a = area(&faces[k]);
+            sum += faces[k].above * a;
+            total += a;
+        }
+        let above = if total > 0.0 { sum / total } else { faces[band[0]].above };
+        let level = if above > LEVEL_GAP {
+            1
+        } else if above < -LEVEL_GAP {
+            -1
+        } else {
+            0
+        };
+        for &k in band {
+            levels[k] = level;
+        }
+        start = end;
     }
-    let above = if total > 0.0 { sum / total } else { 0.0 };
-    if above > LEVEL_GAP {
-        1
-    } else if above < -LEVEL_GAP {
-        -1
-    } else {
-        0
-    }
+    levels
 }
 
 impl Gathered {
@@ -715,21 +733,21 @@ impl Gathered {
         self.add_shape(at - d, at + d, |o| Shape::Crown((at - o).as_vec2().to_array(), r));
     }
 
-    /// Add the faces of one piece - a spline, an object - all on one level: how high the
-    /// piece lies above the ground over all its faces. Taken face by face, a bridge deck some
-    /// 4 m over a canal's bed (Berlin's Schlossbrücke) fell to either side of `LEVEL_GAP`
-    /// triangle by triangle, both levels broke into shreds too small to draw, and the bridge
-    /// showed its markings over nothing.
+    /// Add the faces of one piece - a spline, an object - each surface of it on one level
+    /// (see [`piece_levels`]). Taken face by face, a bridge deck some 4 m over a canal's bed
+    /// (Berlin's Schlossbrücke) fell to either side of `LEVEL_GAP` triangle by triangle, both
+    /// levels broke into shreds too small to draw, and the bridge showed its markings over
+    /// nothing.
     fn add_piece(&mut self, faces: &mut Vec<PieceFace>, ev: &Evidence) {
-        let level = piece_level(faces);
-        for f in faces.drain(..) {
+        let levels = piece_levels(faces);
+        for (f, level) in faces.drain(..).zip(levels) {
             self.add(f.w, f.uv, f.ids, level, ev, f.beside);
         }
     }
 
     /// Count a face for its material and file it under every chunk it reaches
     /// (`beside`: the face is part of a street spline, at the height of its street paths;
-    /// `level`: of the piece it belongs to, see [`Gathered::add_piece`])
+    /// `level`: of its surface in the piece it belongs to, see [`Gathered::add_piece`])
     fn add(
         &mut self,
         w: [DVec3; 3],
@@ -1179,8 +1197,13 @@ pub fn build_surface_stream(
                             above: mid.z - under,
                         });
                     }
-                    keep_floors(&mut piece, floors.streets, &ev);
+                    let deck = keep_floors(&mut piece, floors.streets, &ev);
                     g.add_piece(&mut piece, &ev);
+                    // (a row of houses along a street: on many maps most of the buildings
+                    // are placed so - 1427 of Berlin 156's 1847)
+                    if !deck && !floors.roof.is_empty() {
+                        g.add_roof(&floors.roof, pos, &rot);
+                    }
                     // (a row of trees along a road: each the middle of its type's ranges)
                     if let Some(c) = floors.crown {
                         g.add_crown(pos.truncate(), crown_radius(c, &[]));

@@ -268,10 +268,21 @@ fn a_deck_lies_on_one_level_however_its_faces_straddle_the_gap() {
     let mut deck = square((0.0, 0.0, 0.0), 10.0, 3.9);
     deck.extend(square((10.0, 0.0, 0.0), 10.0, 4.3));
     deck.extend(square((20.0, 0.0, 0.0), 10.0, 4.2));
-    assert_eq!(piece_level(&deck), 1);
-    assert_eq!(piece_level(&square((0.0, 0.0, 0.0), 10.0, 0.1)), 0);
-    assert_eq!(piece_level(&square((0.0, 0.0, 0.0), 10.0, -6.0)), -1);
-    assert_eq!(piece_level(&[]), 0);
+    assert_eq!(piece_levels(&deck), vec![1; 6]);
+    assert_eq!(piece_levels(&square((0.0, 0.0, 0.0), 10.0, 0.1)), vec![0; 2]);
+    assert_eq!(piece_levels(&square((0.0, 0.0, 0.0), 10.0, -6.0)), vec![-1; 2]);
+    assert!(piece_levels(&[]).is_empty());
+}
+
+#[test]
+fn a_deck_and_the_ground_of_one_object_keep_their_own_levels() {
+    // equal areas at 5 m and at 0 m: on average 2.5 m, but a deck over the ground
+    let mut piece = square((0.0, 0.0, 5.0), 10.0, 5.0);
+    piece.extend(square((20.0, 0.0, 0.0), 10.0, 0.0));
+    assert_eq!(piece_levels(&piece), vec![1, 1, 0, 0]);
+    // and a pavement on the deck, 0.2 m above its road, goes with the deck
+    piece.extend(square((0.0, 10.0, 5.2), 3.0, 5.2));
+    assert_eq!(piece_levels(&piece), vec![1, 1, 0, 0, 1, 1]);
 }
 
 #[test]
@@ -305,6 +316,19 @@ fn a_raised_floor_is_kept_where_paths_run_over_it_and_a_roof_is_not() {
     let mut piece = deck();
     keep_floors(&mut piece, true, &Evidence::new(&[]));
     assert_eq!(piece.len(), 8);
+    // tracks over it: a railway bridge - no building, but its deck is not kept either, so
+    // the road under it stays in sight
+    let rails = LaneBuilder::polyline(
+        vec![DVec3::new(-10.0, 5.0, 4.0), DVec3::new(30.0, 5.0, 4.0)],
+        LaneKind::Rail,
+        3.0,
+    );
+    let mut piece = deck();
+    assert!(keep_floors(&mut piece, false, &Evidence::new(&[rails])), "a bridge");
+    assert!(piece.iter().all(|f| f.above <= 1.5));
+    // nothing over it: a house
+    let mut piece = deck();
+    assert!(!keep_floors(&mut piece, false, &Evidence::new(&[])));
 }
 
 fn area_of_layer(chunk: &Chunk, layer: Layer) -> f32 {
@@ -402,4 +426,3 @@ fn a_tree_is_known_by_a_word_of_its_name_not_by_letters_anywhere_in_its_path() {
     assert!(!named("Sceneryobjects/Gewerbe/Baumarkt.sco"));
     assert!(!named("Sceneryobjects/Streets/Haus.sco"));
 }
-
