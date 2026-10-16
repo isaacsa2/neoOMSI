@@ -95,7 +95,7 @@
           "name": "Réinitialiser l'inclinaison de la tête"
         },
         "headtrack": {
-          "name": "Suivi de la tête",
+          "name": "Suivi de la tête"
         },
         "look_sens": {
           "desc": "Vitesse de rotation de la caméra à la souris (100 % = vitesse d’OMSI)",

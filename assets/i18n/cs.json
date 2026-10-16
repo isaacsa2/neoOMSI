@@ -101,7 +101,7 @@
           "name": "Obnovit náklon hlavy"
         },
         "headtrack": {
-          "name": "Sledování hlavy",
+          "name": "Sledování hlavy"
         },
         "look_sens": {
           "desc": "Jak rychle se pohled otočí, když se rozhlédnete myší (100% je rychlost OMSI)",
