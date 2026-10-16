@@ -166,7 +166,7 @@ impl Renderer {
                 let far = match p.cube_eye {
                     Some(e) if p.cube_filled => {
                         let m = cam_w - e;
-                        (m.truncate().length() * 0.1 + m.z.abs()) / to_clouds > 0.003
+                        (m.truncate().length() * 0.3 + m.z.abs()) / to_clouds > 0.0015
                     }
                     _ => true,
                 };
@@ -194,6 +194,17 @@ impl Renderer {
             if diff > 0.03 && p.cloud_age >= 60 {
                 p.cloud_sig = sig;
                 p.cloud_age = 0;
+                p.cube_recapture = p.cube_filled;
+            }
+            let moved = (0..2)
+                .map(|i| {
+                    let d = lighting.cloud_offset[i] - p.cloud_offset[i];
+                    (d - d.round()).abs() * 70000.0
+                })
+                .fold(0.0f32, f32::max);
+            if moved > 6.0 && p.cloud_age >= 8 {
+                p.cloud_offset = lighting.cloud_offset;
+                p.cloud_age = p.cloud_age.min(8);
                 p.cube_recapture = p.cube_filled;
             }
         }
@@ -226,10 +237,7 @@ impl Renderer {
                     .filter(|v| v.is_finite())
                     .unwrap_or(0.08)
                     .clamp(0.02, 0.2),
-                ::legacy_config::env::var("OMSI_ENV_PHOTO")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1.0),
+                0.0,
                 0.0,
             ],
             eye: eye_off.extend(0.0).to_array(),

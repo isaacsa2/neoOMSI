@@ -423,6 +423,7 @@ impl World {
                     extra.display = text_is_display(d.lightmap.is_some(), d.night.is_some());
                     // (the bus's own screen: no glow halo, no FXAA over its letters)
                     extra.screen = true;
+                    extra.text = true;
                     // ([matl_alpha] 1 stays alpha tested: blended, GPM's INEO minutes were a box)
                     let alpha = if d.alpha == AlphaMode::Test {
                         AlphaMode::Test
@@ -439,7 +440,7 @@ impl World {
                         d.night,
                         d.lightmap,
                         None,
-                        [0.0; 3],
+                        d.emissive,
                         extra,
                     );
                     *x = gpu.material(renderer, scene, m);
@@ -902,6 +903,7 @@ impl World {
                     // (chrome: a small opaque part with a sphere map, not the body - see
                     // `MaterialExtra::metal_ok`)
                     extra.metal_ok = envmap.is_some() && alpha == AlphaMode::Opaque && !named_body && !material_has_vehicle_volume(&vm.data, slot);
+                    extra.normals_inward = vm.normals_inward(slot);
                     // A few stock vehicles leave noZwrite off on window/dirt materials even
                     // though their alpha mode is Blend. They are transparent colour layers,
                     // not solid shadow casters; letting them into the shadow map paints the
@@ -990,9 +992,7 @@ impl World {
                         // an LED panel: see `MaterialExtra::led`)
                         it_extra.led = (it_script_trans.is_some() || script_item.is_some()) && !html_page(it_script_trans) && !html_page(script_item) && if ov_item.iter().any(|o| o.lightmap.is_some()) { lm_white(ov_item) } else { lm_white(&ov) };
                         it_extra.html = !it_extra.led && (html_page(script_item) || html_page(it_script_trans));
-                        it_extra.no_z_write |= extra.no_z_write;
-                        it_extra.no_z_check |= extra.no_z_check;
-                        it_extra.glass |= extra.glass;
+                        inherit_base_extra(&mut it_extra, &extra);
                         if repair_body_depth {
                             it_extra.no_z_check = false;
                         }
@@ -1050,8 +1050,6 @@ impl World {
                         item_only,
                         dirs: dirs.clone(),
                         textures: self.textures.clone(),
-                        cache: HashMap::new(),
-                        more_cache: HashMap::new(),
                         texture_cache: HashMap::new(),
                         current: None,
                         texture: None,
@@ -1060,9 +1058,9 @@ impl World {
                         wants_upgrade: self.freetex_upgrades.clone(),
                     }).collect();
                     let multi_light = |base: MaterialId, item: MaterialId| -> Option<MultiLight> {
-                        let list = ov.iter().map(|o| &o.lightmaps).find(|l| !l.is_empty())?;
-                        let maps: Vec<(PathBuf, String)> = list
+                        let maps: Vec<(PathBuf, String)> = ov
                             .iter()
+                            .flat_map(|o| &o.lightmaps)
                             .filter_map(|(t, v)| ::texture::find_texture(t, &dirs_ref).map(|p| (p, v.clone())))
                             .collect();
                         (maps.len() >= 2 && maps.len() <= 8).then(|| MultiLight {
@@ -1077,9 +1075,9 @@ impl World {
                     };
                     if spec.item.is_some() || !entries.is_empty() || !free.is_empty() {
                         let tex_var = master.map(|m| m.variable.clone()).unwrap_or_default();
-                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more, var: change_var.unwrap_or_default(), more_vars: change_vars.iter().skip(1).cloned().collect(), entries, tex_var, free, spec, base_tex, entry_tex, lights: multi_light(base, item) });
+                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more, var: change_var.unwrap_or_default(), more_vars: change_vars.iter().skip(1).cloned().collect(), entries, tex_var, free, free_cache: HashMap::new(), spec, base_tex, entry_tex, lights: multi_light(base, item) });
                     } else if let Some(lights) = multi_light(base, item) {
-                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more: Vec::new(), var: String::new(), more_vars: Vec::new(), entries, tex_var: String::new(), free: Vec::new(), spec, base_tex, entry_tex, lights: Some(lights) });
+                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more: Vec::new(), var: String::new(), more_vars: Vec::new(), entries, tex_var: String::new(), free: Vec::new(), free_cache: HashMap::new(), spec, base_tex, entry_tex, lights: Some(lights) });
                     } else if base_dyn.any() {
                         dyn_slots.push(DynSlot { mesh: instances.len(), slot, text: text_slot, script: script_slot, script_trans, tex, alpha, transmap, night, lightmap, envmap, address, extra, color, emissive });
                     }

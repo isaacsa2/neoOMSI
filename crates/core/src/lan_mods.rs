@@ -1168,6 +1168,51 @@ mod tests {
         }
     }
 
+    /// A joining player gets the files the host's own game uses. If two mods ship the same object,
+    /// the joining player gets the copy from the mod higher in the load order.
+    #[test]
+    fn the_host_sends_the_files_its_own_game_uses() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("lan-mods-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (town, high, low, omsi) = (dir.join("town"), dir.join("high"), dir.join("low"), dir.join("omsi"));
+        let put = |root: &Path, rel: &str, data: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, data).unwrap();
+        };
+        put(&town, "maps/Town/global.cfg", "[name]\r\nTown\r\n");
+        put(&town, "maps/Town/tile_0_0.map", "[object]\r\n0\r\nSceneryobjects\\LanShared\\a.sco\r\n");
+        put(&high, "Sceneryobjects/LanShared/a.sco", "high");
+        put(&low, "Sceneryobjects/LanShared/a.sco", "low");
+        std::fs::create_dir_all(&omsi).unwrap();
+        for root in [&town, &high, &low, &omsi] {
+            ::mods::add_content_root(root.clone());
+        }
+        let args = crate::Args::parse_from([
+            "neoomsi",
+            "--root",
+            &omsi.to_string_lossy(),
+            "--map",
+            "maps/Town/global.cfg",
+        ]);
+        let (manifest, sources) = collect(&args);
+        let rel = "Sceneryobjects/LanShared/a.sco";
+        let index = manifest
+            .entries
+            .iter()
+            .position(|entry| entry.path.eq_ignore_ascii_case(rel))
+            .expect("the object goes to the players");
+        let used_by_host = ::mods::resolve_path(&omsi, rel);
+        assert_eq!(sources[index], used_by_host);
+        assert_eq!(std::fs::read(&sources[index]).unwrap(), b"high");
+        assert_eq!(manifest.entries[index].sha256, sha256_of(b"high"));
+        for root in [&town, &high, &low, &omsi] {
+            ::mods::remove_content_root(root);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn programs_are_seen_by_their_content() {
         assert!(looks_executable(b"MZ\x90\x00"));

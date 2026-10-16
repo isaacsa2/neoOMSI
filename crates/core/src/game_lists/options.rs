@@ -57,8 +57,9 @@ pub(crate) fn steps_of(verb: &str) -> Option<Vec<f32>> {
         "steer_look_response" => (1..=20).map(|v| v as f32 * 0.05).collect(),
         "pedal_t" | "pedal_b" => PEDAL.to_vec(),
         "mouse_sens" => (10..=300).map(|v| v as f32 / 100.0).collect(),
-        "stick_sens" => (2..=40).map(|v| v as f32 * 0.05).collect(),
+        "stick_sens" => (10..=200).map(|v| v as f32 / 100.0).collect(),
         "look_sens" => (2..=40).map(|v| v as f32 * 0.05).collect(),
+        "head_strength" => (0..=40).map(|v| v as f32 * 0.05).collect(),
         "seat" => (-50..=50).map(|v| v as f32 / 100.0).collect(),
         "head_pitch" => (-45..=45).map(|v| v as f32).collect(),
         "hour" => (0..24).map(|v| v as f32).collect(),
@@ -116,6 +117,16 @@ mod tests {
         assert_eq!(steps.first(), Some(&-45.0));
         assert_eq!(steps.last(), Some(&45.0));
         assert!(steps.windows(2).all(|w| w[1] - w[0] == 1.0));
+    }
+
+    #[test]
+    fn stick_sensitivity_slider_moves_in_one_percent_steps() {
+        let steps = steps_of("stick_sens").unwrap();
+        assert_eq!(steps.len(), 191);
+        assert_eq!(steps.first(), Some(&0.1));
+        assert_eq!(steps.last(), Some(&2.0));
+        assert!(steps.contains(&1.0));
+        assert!(steps.contains(&0.37));
     }
 }
 
@@ -201,6 +212,9 @@ pub(crate) fn option_now(app: Option<&App>, verb: &str, arg: &str) -> Option<f32
         "mouse_sens" => ::config::get_float("controls", "mouse_sens").unwrap_or(1.0) as f32,
         "stick_sens" => ::config::get_float("controls", "stick_sens").unwrap_or(1.0) as f32,
         "look_sens" => ::config::get_float("camera", "look_sens").unwrap_or(1.0) as f32,
+        "head_strength" => {
+            ::config::get_float("camera", "head_movement_strength").unwrap_or(1.0) as f32
+        }
         "ui_scale" => ::config::get_float("ui", "scale").unwrap_or(1.0) as f32,
         "ui_opacity" => ::config::get_float("ui", "opacity")
             .unwrap_or(0.85)
@@ -335,6 +349,15 @@ pub(crate) fn option_set(
         }
         "look_sens" => {
             ::config::set_setting("camera", "look_sens", ((v * 100.0).round() / 100.0) as f64);
+            let _ = ::config::save();
+            None
+        }
+        "head_strength" => {
+            ::config::set_setting(
+                "camera",
+                "head_movement_strength",
+                ((v * 100.0).round() / 100.0).clamp(0.0, 2.0) as f64,
+            );
             let _ = ::config::save();
             None
         }
@@ -567,6 +590,11 @@ pub(crate) fn toggle_now(app: Option<&App>, id: &str) -> Option<bool> {
         "nav_stops_ext" => nav.map_or(::config::get_bool("navigator", "stops_ext").unwrap_or(false), |n| n.schedule),
         "shadows" => ::config::get_bool("graphics", "shadows").unwrap_or(true),
         "head" => ::config::get_bool("camera", "head_movement").unwrap_or(true),
+        "head_vertical" => ::config::get_bool("camera", "head_movement_vertical").unwrap_or(true),
+        "head_longitudinal" => {
+            ::config::get_bool("camera", "head_movement_longitudinal").unwrap_or(true)
+        }
+        "head_lateral" => ::config::get_bool("camera", "head_movement_lateral").unwrap_or(true),
         "cam_smooth" => ::config::get_bool("camera", "smooth").unwrap_or(true),
         "coll_objects" => ::config::get_bool("gameplay", "collision_objects").unwrap_or(true),
         "coll_vehicles" => ::config::get_bool("gameplay", "collision_vehicles").unwrap_or(true),
@@ -762,6 +790,16 @@ fn toggle_set_inner(mut app: Option<&mut App>, id: &str, on: bool) -> Option<(&'
         }
         "head" => {
             ::config::set_setting("camera", "head_movement", on);
+            let _ = ::config::save();
+            None
+        }
+        "head_vertical" | "head_longitudinal" | "head_lateral" => {
+            let key = match id {
+                "head_vertical" => "head_movement_vertical",
+                "head_longitudinal" => "head_movement_longitudinal",
+                _ => "head_movement_lateral",
+            };
+            ::config::set_setting("camera", key, on);
             let _ = ::config::save();
             None
         }
@@ -1150,6 +1188,20 @@ fn toggle_set_inner(mut app: Option<&mut App>, id: &str, on: bool) -> Option<(&'
         _ => None,
     }
 }
+/// Alt+Enter: between a normal window and fullscreen, kept in the settings.
+pub(crate) fn toggle_fullscreen(window: &winit::window::Window) {
+    let mode = if ::config::get_bool("graphics", "triple_screen").unwrap_or(false)
+        || window.fullscreen().is_some()
+    {
+        "windowed"
+    } else {
+        "fullscreen"
+    };
+    ::config::set_setting("graphics", "window_mode", mode);
+    let _ = ::config::save();
+    window.set_fullscreen((mode == "fullscreen").then(|| exclusive_fullscreen(window)));
+}
+
 pub(crate) fn apply_window_mode(app: &App, mode: &str) {
     let Some(window) = app.window.as_ref() else {
         return;
@@ -1167,6 +1219,14 @@ pub(crate) fn exclusive_fullscreen(window: &winit::window::Window) -> winit::win
     let Some(monitor) = window.current_monitor() else {
         return winit::window::Fullscreen::Borderless(None);
     };
+    // (Wayland has no exclusive mode: winit ignored the request and the game stayed a window)
+    #[cfg(target_os = "linux")]
+    {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(RawWindowHandle::Wayland(_)) = window.window_handle().map(|h| h.as_raw()) {
+            return winit::window::Fullscreen::Borderless(Some(monitor));
+        }
+    }
     let size = monitor.size();
     let refresh = monitor.refresh_rate_millihertz();
     let fallback = winit::window::Fullscreen::Borderless(Some(monitor.clone()));

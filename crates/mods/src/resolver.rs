@@ -1,6 +1,9 @@
 use legacy_config::{content_changed, find_in_dir, name_key, resolve_existing_with, vfs, windows_components};
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 fn resolve_existing(base: &Path, rel: &[&str]) -> Option<PathBuf> {
     resolve_existing_with(base, rel, &|cur| {
@@ -15,7 +18,7 @@ fn pop_within_roots(cur: &mut PathBuf) {
     cur.pop();
 }
 
-static CONTENT_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static CONTENT_ROOTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 pub fn add_content_root(root: PathBuf) {
     let mut r = CONTENT_ROOTS.lock().unwrap();
@@ -52,44 +55,7 @@ pub fn remove_content_root(root: &Path) {
     content_changed();
 }
 
-static ROOT_SCOPES: std::sync::Mutex<Vec<(PathBuf, Vec<PathBuf>)>> =
-    std::sync::Mutex::new(Vec::new());
-
-pub fn set_root_scope(root: PathBuf, fallbacks: Vec<PathBuf>) {
-    let mut s = ROOT_SCOPES.lock().unwrap();
-    s.retain(|(r, _)| r != &root);
-    s.push((root, fallbacks));
-    drop(s);
-    content_changed();
-}
-
-pub fn clear_root_scope(root: &Path) {
-    ROOT_SCOPES.lock().unwrap().retain(|(r, _)| r != root);
-    content_changed();
-}
-
-fn chain_for(base: &Path) -> Vec<PathBuf> {
-    let roots = content_roots();
-    let Some(owner) = owner_root(base, &roots).cloned() else {
-        return roots;
-    };
-    let scopes = ROOT_SCOPES.lock().unwrap();
-    match scopes.iter().find(|(r, _)| r == &owner) {
-        Some((_, fallbacks)) if fallbacks.is_empty() && owner == base => roots,
-        Some((_, fallbacks)) => {
-            let mut chain = vec![owner];
-            for f in fallbacks {
-                if !chain.contains(f) {
-                    chain.push(f.clone());
-                }
-            }
-            chain
-        }
-        None => roots,
-    }
-}
-
-static SANDBOX_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static SANDBOX_ROOTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 pub fn mark_sandbox(root: PathBuf) {
     let mut r = SANDBOX_ROOTS.lock().unwrap();
@@ -146,84 +112,14 @@ pub fn mirrored_dirs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn owner_root<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
+pub(crate) fn owner_root<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
     roots
         .iter()
         .filter(|r| path.starts_with(r))
         .max_by_key(|r| r.components().count())
 }
 
-fn mirrored_base(base: &Path, root: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
-    let owner = owner_root(base, roots)?;
-    if owner == root {
-        return None;
-    }
-    base.strip_prefix(owner)
-        .ok()
-        .map(|suffix| root.join(suffix))
-}
-
-fn vehicle_package(base: &Path, owner: &Path, rel: &[&str]) -> Option<String> {
-    let suffix = base.strip_prefix(owner).ok()?;
-    let mut parts: Vec<String> = suffix
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-    for comp in rel {
-        if *comp == ".." {
-            parts.pop();
-        } else {
-            parts.push(comp.to_string());
-        }
-    }
-    if parts.len() >= 3 && parts[0].eq_ignore_ascii_case("Vehicles") {
-        Some(format!("Vehicles/{}", parts[1]))
-    } else {
-        None
-    }
-}
-
-fn package_definitions(root: &Path, package: &str) -> std::collections::HashSet<String> {
-    let comps: Vec<&str> = package.split('/').collect();
-    let Some(dir) = resolve_existing(root, &comps) else {
-        return Default::default();
-    };
-    vfs::list_dir(&dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, is_dir)| !is_dir)
-        .map(|(n, _)| name_key(&n.to_string_lossy()))
-        .filter(|n| n.ends_with(".bus") || n.ends_with(".ovh") || n.ends_with(".zug"))
-        .collect()
-}
-
-fn overlays_package(over: &Path, owner: &Path, package: &str) -> bool {
-    type Key = (PathBuf, PathBuf, String);
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Key, bool>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let key = (
-        over.to_path_buf(),
-        owner.to_path_buf(),
-        package.to_ascii_lowercase(),
-    );
-    if let Some(v) = cache.lock().unwrap().get(&key) {
-        return *v;
-    }
-    let comps: Vec<&str> = package.split('/').collect();
-    let owner_has = resolve_existing(owner, &comps)
-        .map(|d| vfs::is_dir(&d))
-        .unwrap_or(false);
-    let theirs = package_definitions(over, package);
-    let ok =
-        !owner_has || theirs.is_empty() || theirs.is_subset(&package_definitions(owner, package));
-    cache.lock().unwrap().insert(key, ok);
-    ok
-}
-
+/// The `Vehicles` pack that `path` points into, if no content root has that pack.
 pub fn missing_vehicle_pack(path: &Path) -> Option<String> {
     let roots = content_roots();
     let owner = owner_root(path, &roots)?.clone();
@@ -267,27 +163,90 @@ pub fn read_dir_merged(rel: &str) -> Vec<PathBuf> {
     out
 }
 
+/// The packs of a root, such as `Vehicles/Bus`, sorted. Only pack folders are listed: a folder
+/// such as `Texture` can hold thousands of files, and this runs on every engine poll.
+pub(crate) fn pack_dirs(root: &Path) -> Vec<(OsString, OsString)> {
+    let mut out = Vec::new();
+    for (top, is_dir) in vfs::list_dir(root).unwrap_or_default() {
+        if is_dir && crate::layout::is_pack_folder(&top.to_string_lossy()) {
+            for (pack, is_dir) in vfs::list_dir(&root.join(&top)).unwrap_or_default() {
+                if is_dir {
+                    out.push((top.clone(), pack));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The roots containing the pack that `path` points into, so lookups can skip the others.
+/// `None` when the path isn't in a pack folder, or its names aren't ASCII.
+fn roots_with_pack(path: &[&str]) -> Option<Vec<PathBuf>> {
+    type Index = (u64, HashMap<String, Vec<PathBuf>>);
+    static INDEX: Mutex<Option<Index>> = Mutex::new(None);
+    let ([top, pack], true) = (path.first_chunk::<2>()?, path.len() > 2) else {
+        return None;
+    };
+    if !top.is_ascii() || !pack.is_ascii() || !crate::layout::is_pack_folder(top) {
+        return None;
+    }
+    let key = format!("{}/{}", name_key(top), name_key(pack));
+    let mut index = INDEX.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = legacy_config::content_generation();
+    if index.as_ref().is_none_or(|(built, _)| *built != generation) {
+        let mut packs: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for root in content_roots() {
+            for (top, pack) in pack_dirs(&root) {
+                let key = format!(
+                    "{}/{}",
+                    name_key(&top.to_string_lossy()),
+                    name_key(&pack.to_string_lossy())
+                );
+                let roots = packs.entry(key).or_default();
+                if !roots.contains(&root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+        *index = Some((generation, packs));
+    }
+    Some(index.as_ref()?.1.get(&key).cloned().unwrap_or_default())
+}
+
+/// The file the game uses for `rel`, relative to `base`. Higher roots win, and `..` never
+/// climbs out of a root.
 pub fn resolve_path(base: &Path, rel: &str) -> PathBuf {
     let rel = windows_components(rel);
     let rel = rel.as_slice();
-    let roots = chain_for(base);
-    let owner = if roots.len() > 1 {
-        owner_root(base, &roots).cloned()
-    } else {
-        None
-    };
+    let roots = content_roots();
+    let owner = owner_root(base, &roots).cloned();
+    let from_top: Vec<String> = owner
+        .as_ref()
+        .and_then(|owner| base.strip_prefix(owner).ok())
+        .map(|suffix| {
+            suffix
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut path: Vec<&str> = Vec::new();
+    for component in from_top.iter().map(String::as_str).chain(rel.iter().copied()) {
+        // A `..` at the top of a root stays at the top.
+        if component == ".." {
+            path.pop();
+        } else {
+            path.push(component);
+        }
+    }
+    let from_top = path;
+    let candidates = roots_with_pack(&from_top);
+    let has_pack = |root: &PathBuf| candidates.as_ref().is_none_or(|with_pack| with_pack.contains(root));
     if let Some(owner) = &owner {
-        let package = vehicle_package(base, owner, rel);
-        for r in roots.iter().take_while(|r| *r != owner) {
-            if let Some(pkg) = &package {
-                if !overlays_package(r, owner, pkg) {
-                    continue;
-                }
-            }
-            if let Some(mb) = mirrored_base(base, r, &roots) {
-                if let Some(p) = resolve_existing(&mb, rel) {
-                    return p;
-                }
+        for root in roots.iter().take_while(|root| *root != owner).filter(|root| has_pack(root)) {
+            if let Some(found) = resolve_existing(root, &from_top) {
+                return found;
             }
         }
     }
@@ -306,16 +265,13 @@ pub fn resolve_path(base: &Path, rel: &str) -> PathBuf {
         cur = found.unwrap_or(direct);
     }
     if let (Some(owner), false) = (&owner, vfs::exists(&cur)) {
-        for r in roots.iter().filter(|r| *r != owner) {
-            if let Some(mb) = mirrored_base(base, r, &roots) {
-                if let Some(p) = resolve_existing(&mb, rel) {
-                    return p;
-                }
+        for root in roots.iter().skip_while(|root| *root != owner).skip(1).filter(|root| has_pack(root)) {
+            if let Some(found) = resolve_existing(root, &from_top) {
+                return found;
             }
         }
     }
-    let all = content_roots();
-    if owner_root(base, &all).is_some() && owner_root(&cur, &all).is_none() {
+    if owner.is_some() && owner_root(&cur, &roots).is_none() {
         return base.to_path_buf();
     }
     cur
@@ -392,6 +348,7 @@ mod tests {
 
     #[test]
     fn never_leaves_the_roots() {
+        let _roots = crate::roots_guard();
         let dir = std::env::temp_dir().join(format!("mods-escape-{}", std::process::id()));
         let root = dir.join("root");
         std::fs::create_dir_all(root.join("Vehicles")).unwrap();
@@ -404,29 +361,80 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    type Guard = std::sync::MutexGuard<'static, ()>;
+
+    fn layers(test: &str, names: &[&str]) -> (Guard, PathBuf, Vec<PathBuf>) {
+        let guard = crate::roots_guard();
+        let dir = std::env::temp_dir().join(format!("mods-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let roots: Vec<PathBuf> = names.iter().map(|name| dir.join(name)).collect();
+        for root in &roots {
+            std::fs::create_dir_all(root).unwrap();
+            add_content_root(root.clone());
+        }
+        (guard, dir, roots)
+    }
+
+    fn put(root: &Path, rel: &str, data: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, data).unwrap();
+    }
+
+    fn done(dir: &Path, roots: &[PathBuf]) {
+        for root in roots {
+            remove_content_root(root);
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn read(path: PathBuf) -> String {
+        String::from_utf8(vfs::read(&path).unwrap()).unwrap()
+    }
+
     #[test]
-    fn first_root_wins() {
-        let dir = std::env::temp_dir().join(format!("mods-order-{}", std::process::id()));
-        let (a, b, legacy) = (dir.join("a"), dir.join("b"), dir.join("legacy"));
-        for r in [&a, &b, &legacy] {
-            std::fs::create_dir_all(r.join("Vehicles").join("Bus")).unwrap();
-        }
-        std::fs::write(a.join("Vehicles/Bus/x.txt"), b"a").unwrap();
-        std::fs::write(b.join("Vehicles/Bus/x.txt"), b"b").unwrap();
-        std::fs::write(legacy.join("Vehicles/Bus/x.txt"), b"legacy").unwrap();
-        std::fs::write(b.join("Vehicles/Bus/only_b.txt"), b"b").unwrap();
-        add_content_root(a.clone());
-        add_content_root(b.clone());
-        add_content_root(legacy.clone());
-        set_root_scope(legacy.clone(), Vec::new());
-        let base = legacy.join("Vehicles").join("Bus");
-        assert_eq!(vfs::read(&resolve_path(&base, "x.txt")).unwrap(), b"legacy");
-        assert_eq!(vfs::read(&resolve_path(&legacy, "Vehicles/Bus/x.txt")).unwrap(), b"a");
-        assert!(!vfs::exists(&resolve_path(&base, "only_b.txt")));
-        for r in [&a, &b, &legacy] {
-            clear_root_scope(r);
-            remove_content_root(r);
-        }
-        std::fs::remove_dir_all(&dir).ok();
+    fn the_higher_root_wins_for_every_file_that_asks() {
+        let (_roots, dir, roots) = layers("order", &["addon", "base", "omsi"]);
+        let (addon, base, omsi) = (&roots[0], &roots[1], &roots[2]);
+        put(base, "Vehicles/Bus/model/model.cfg", "base");
+        put(base, "Vehicles/Bus/Texture/body.dds", "base");
+        put(base, "Vehicles/Bus/Texture/seat.dds", "base");
+        put(addon, "Vehicles/Bus/Texture/body.dds", "addon");
+        put(omsi, "Vehicles/SD200/Texture/body.dds", "stock");
+        put(addon, "Vehicles/SD200/Texture/body.dds", "addon");
+        // The base mod's own references get the addon's files where the addon has them.
+        let model = base.join("Vehicles/Bus/model");
+        assert_eq!(read(resolve_path(&model, "../Texture/body.dds")), "addon");
+        assert_eq!(read(resolve_path(&model, "../Texture/seat.dds")), "base");
+        // A stock file's reference gets the mod's copy, and the original stays untouched.
+        let stock = omsi.join("Vehicles/SD200/model");
+        assert_eq!(read(resolve_path(&stock, "../Texture/body.dds")), "addon");
+        assert_eq!(read(omsi.join("Vehicles/SD200/Texture/body.dds")), "stock");
+        // The same applies to paths from the top of the OMSI folder.
+        assert_eq!(read(resolve_path(omsi, "Vehicles/Bus/Texture/body.dds")), "addon");
+        done(&dir, &roots);
+    }
+
+    #[test]
+    fn a_mod_uses_parts_of_another_mod() {
+        let (_roots, dir, roots) = layers("cross", &["citaro", "urbino", "omsi"]);
+        let (citaro, urbino) = (&roots[0], &roots[1]);
+        put(urbino, "Vehicles/Urbino/model/dash.o3d", "urbino");
+        std::fs::create_dir_all(citaro.join("Vehicles/Citaro/model")).unwrap();
+        let dash = resolve_path(&citaro.join("Vehicles/Citaro/model"), "../../Urbino/model/dash.o3d");
+        assert_eq!(read(dash.clone()), "urbino");
+        assert_eq!(missing_vehicle_pack(&citaro.join("Vehicles/Missing/a.o3d")).as_deref(), Some("Missing"));
+        assert_eq!(missing_vehicle_pack(&dash), None);
+        done(&dir, &roots);
+    }
+
+    #[test]
+    fn a_dot_dot_never_climbs_out_of_a_root() {
+        let (_roots, dir, roots) = layers("clamp", &["a", "b"]);
+        put(&dir, "secret.txt", "x");
+        put(&roots[1], "Vehicles/Bus/bus.bus", "b");
+        let found = resolve_path(&roots[0].join("Vehicles"), "../../../secret.txt");
+        assert!(roots.iter().any(|root| found.starts_with(root)), "{}", found.display());
+        done(&dir, &roots);
     }
 }

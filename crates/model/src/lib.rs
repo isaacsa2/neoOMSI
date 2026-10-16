@@ -146,7 +146,9 @@ pub struct MeshDef {
     pub anim_parent: Option<String>,
     pub animations: Vec<Animation>,
     pub visible: Option<(String, f32)>,
-    pub illumination: Vec<i32>,
+    /// `[illumination]`'s five-bit disable mask (bits 0..4 map OMSI light slots; `0x10`
+    /// disables the mesh's `[illumination_interior]` lighting).
+    pub illumination: u8,
     pub illumination_interior: Vec<i32>,
     pub materials: Vec<MaterialDef>,
     pub mesh_ident: Option<String>,
@@ -156,6 +158,13 @@ pub struct MeshDef {
     /// Compatibility mirror of the last `[terrainhole]` after this mesh. Use
     /// [`Model::terrain_hole_meshes`] to include model-wide and repeated declarations.
     pub terrain_hole: Option<String>,
+}
+
+impl MeshDef {
+    /// Whether this mesh receives the interior lights listed by `[illumination_interior]`.
+    pub fn interior_lights_enabled(&self) -> bool {
+        self.illumination & 0x10 == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -209,6 +218,8 @@ pub struct Spotlight2 {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct InteriorLight {
+    /// Model mesh that owns this `[interiorlight]` record, if it follows a `[mesh]`.
+    pub mesh: Option<usize>,
     pub variable: String,
     pub range: f32,
     pub color: [f32; 3],
@@ -712,6 +723,7 @@ impl Model {
                 self.meshes.push(MeshDef {
                     file,
                     lod: self.lods.len() - 1,
+                    illumination: 4,
                     illumination_interior,
                     ..Default::default()
                 });
@@ -794,9 +806,10 @@ impl Model {
                 }
             }
             "illumination" => {
-                let v: Vec<i32> = (0..4).map(|_| r.i32()).collect();
                 if let Some(m) = self.cur_mesh() {
-                    m.illumination = v;
+                    m.illumination = r.i32().clamp(0, 255) as u8;
+                } else {
+                    let _ = r.i32();
                 }
             }
             // (OMSI's four lamps, and neoOMSI takes as many more as the lines that follow
@@ -918,6 +931,7 @@ impl Model {
                 let color = r.f32s::<3>();
                 let pos = r.f32s::<3>();
                 self.interior_lights.push(InteriorLight {
+                    mesh: self.meshes.len().checked_sub(1),
                     variable,
                     range,
                     color,
@@ -1458,6 +1472,15 @@ mod tests {
     }
 
     #[test]
+    fn negative_animation_maxspeed_is_parsed() {
+        let model = Model::parse(&CfgFile::from_str(
+            "model.cfg",
+            "[mesh]\na.o3d\n[newanim]\nanim_trans\nspeed\n1\nmaxspeed\n-2.5\n",
+        ));
+        assert_eq!(model.meshes[0].animations[0].max_speed, -2.5);
+    }
+
+    #[test]
     fn disabled_meshes() {
         let text = "[mesh]\na.o3d\n-<DISABLED>-\nSchalter06\n[mesh]\nb.o3d\n[newanim]\nanim_rot\nx\n1\n-<ENABLED>-\n[mesh]\nc.o3d\n";
         let m = Model::parse(&CfgFile::from_str("model.cfg", text));
@@ -1479,6 +1502,44 @@ mod tests {
         assert_eq!(d.len(), 2);
         let chain = d.iter().find(|d| d.texture == "chain.dds").unwrap();
         assert!(chain.envmap.is_some() && chain.alpha_set && chain.alpha == 1);
+    }
+}
+
+#[cfg(test)]
+mod illumination_tests {
+    use super::*;
+
+    #[test]
+    fn illumination_reads_one_bitmask_line() {
+        let model = Model::parse(&CfgFile::from_str(
+            "model.cfg",
+            "[mesh]\nbody.o3d\n[illumination]\n20\n[matl]\nbody.bmp\n0\n",
+        ));
+        assert_eq!(model.meshes[0].illumination, 20);
+        assert_eq!(model.meshes[0].materials[0].texture, "body.bmp");
+        assert_eq!(
+            Model::parse(&CfgFile::from_str("model.cfg", "[mesh]\nbody.o3d\n")).meshes[0]
+                .illumination,
+            4
+        );
+    }
+
+    #[test]
+    fn interior_lights_remember_the_owning_mesh() {
+        let model_cfg = "[interiorlight]\nconstant\n1\n255\n255\n255\n0\n0\n0\n\
+                          [mesh]\na.o3d\n\
+                          [interiorlight]\nconstant\n1\n255\n255\n255\n0\n0\n0\n\
+                          [mesh]\nb.o3d\n\
+                          [interiorlight]\nconstant\n1\n255\n255\n255\n0\n0\n0\n";
+        let model = Model::parse(&CfgFile::from_str("model.cfg", model_cfg));
+        assert_eq!(
+            model
+                .interior_lights
+                .iter()
+                .map(|l| l.mesh)
+                .collect::<Vec<_>>(),
+            [None, Some(0), Some(1)]
+        );
     }
 }
 

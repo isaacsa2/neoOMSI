@@ -11,6 +11,12 @@ pub(crate) fn is_null_texture(name: &str) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("null"))
 }
 
+/// Whether a texture slot names a real file: not a null texture, and not the bare number some model
+/// files put in place of a file name.
+pub(crate) fn names_texture(name: &str) -> bool {
+    !is_null_texture(name) && name.trim().parse::<f64>().is_err()
+}
+
 pub(super) fn scenery_texture_key(name: &str) -> String {
     name.trim().replace('\\', "/").to_ascii_lowercase()
 }
@@ -159,6 +165,7 @@ pub(super) fn material_extra(
         water: false,
         display: false,
         screen: false,
+        text: false,
         led: false,
         html: false,
         no_map_lights: false,
@@ -173,7 +180,17 @@ pub(super) fn material_extra(
             .filter(|o| o.tex_address == ::model::TexAddress::Border)
             .map(|o| o.border_color.map(|c| (c / 255.0).clamp(0.0, 1.0))),
         metal_ok: false,
+        normals_inward: false,
     }
+}
+
+/// What a `[matl_item]` variant keeps from its base slot: the depth flags, glass, and the
+/// mesh's normals (#117: the item does not change the geometry).
+pub(super) fn inherit_base_extra(item: &mut MaterialExtra, base: &MaterialExtra) {
+    item.no_z_write |= base.no_z_write;
+    item.no_z_check |= base.no_z_check;
+    item.glass |= base.glass;
+    item.normals_inward = base.normals_inward;
 }
 
 /// The addressing of a slot's textures: its last `[matl_texadress_*]` command decides (the

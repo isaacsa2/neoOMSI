@@ -63,13 +63,14 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
                 "keysearch" => {}
                 "setup_root" if step => crate::lab_options::game_root_pick(),
                 "update_now" if step => crate::lab_options::update_check_now(app),
-                "mods_install" if step => crate::lab_options::mods_install(),
+                "mods_install" if step => crate::lab_mods::install(Some(app)),
                 "mods_open" if step => {
                     if let Some(d) = ::mods::mods_dir() {
                         let _ = std::fs::create_dir_all(&d);
                         crate::updater::open_folder(&d);
                     }
                 }
+                v if step && v.starts_with("mod_") => crate::lab_mods::apply_in_game(app, v, arg),
                 "pax_pack_get" if step => {
                     crate::pax_pack::shared(crate::startup::content_dir, crate::pax_pack::PaxPack::start);
                 }
@@ -305,6 +306,10 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
             None
         }
         ListKind::Destinations if verb == "routes" => Some(ListKind::RouteNumbers),
+        ListKind::Destinations if verb == "dest_sort" => {
+            app.dest_sort = app.dest_sort.next();
+            Some(ListKind::Destinations)
+        }
         ListKind::RouteNumbers if verb == "route_type" => match app.menu_edit.take() {
             Some(t) => {
                 set_route_by_hand(app, &t);

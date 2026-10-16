@@ -18,6 +18,8 @@ pub(crate) struct ProfileMark {
     pub(crate) stages: std::collections::BTreeMap<&'static str, f64>,
     pub(crate) render: std::collections::BTreeMap<&'static str, f64>,
     pub(crate) counts: std::collections::BTreeMap<&'static str, f64>,
+    /// The GPU passes' averages (ms) and frame counts so far.
+    pub(crate) gpu: Vec<(String, f64, u32)>,
 }
 
 pub(crate) struct Boot {
@@ -155,6 +157,8 @@ pub(crate) struct App {
     pub(crate) menu_edit: Option<String>,
     pub(crate) menu_edit_icao: bool,
     pub(crate) menu_edit_date: bool,
+    /// Destination list order (#447).
+    pub(crate) dest_sort: game_lists::DestSort,
     pub(crate) swap_pending: bool,
     pub(crate) menu_drag: Option<usize>,
     pub(crate) menu_kbd: bool,
@@ -256,6 +260,8 @@ pub(crate) struct App {
     /// The stage, renderer stage and count totals when `cpu_mark` was taken: the summary
     /// averages over the steady frames after it, not over the loading.
     pub(crate) profile_mark: Option<ProfileMark>,
+    /// When the player's bus first stood in the world (OMSI_PROFILE's mark without --exit-after).
+    pub(crate) play_since: Option<Instant>,
     pub(crate) plugins: Option<legacy_plugin::Plugins>,
     pub(crate) touch: touch::Touch,
 }
@@ -920,20 +926,25 @@ impl App {
                                 let msg = p.start_up();
                                 self.service_msg = Some((msg, 6.0));
                             }
-                            if !p.vehicle.ty.missing_packs.is_empty() {
-                                let packs: Vec<String> = p
-                                    .vehicle
-                                    .ty
-                                    .missing_packs
-                                    .iter()
-                                    .map(|(n, _)| n.clone())
-                                    .collect();
-                                let msg = format!(
-                                    "This bus takes parts from vehicle pack(s) that are not installed: {} (install them for its displays and devices)",
-                                    packs.join(", ")
+                            // The summary also covers the vehicle packs the bus is missing.
+                            let found = omsi_launcher_lib::instances::undismissed(
+                                crate::lab_mods::save_drive(),
+                            );
+                            if let Some(msg) = ::mods::diagnostics::summary(&found) {
+                                let tr = |key: &str| ::i18n::translate(key, &[]);
+                                let menu_path = format!(
+                                    "{} > {} > {}",
+                                    tr("pause.entry.options"),
+                                    tr("pause.options.group.mods"),
+                                    tr(crate::lab_mods::MISSING_TAB)
                                 );
+                                let see = ::i18n::translate(
+                                    "pause.options.mods.missing.see",
+                                    &[("path", &menu_path)],
+                                );
+                                let msg = format!("{msg} · {see}");
                                 self.service_msg = Some(match self.service_msg.take() {
-                                    Some((m, _)) => (format!("{m}   |   {msg}"), 12.0),
+                                    Some((shown, _)) => (format!("{shown}   |   {msg}"), 12.0),
                                     None => (msg, 12.0),
                                 });
                             }

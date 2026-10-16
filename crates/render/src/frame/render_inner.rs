@@ -614,7 +614,12 @@ impl Renderer {
             ],
             spot_vp,
             spot_info,
-            tune: [lighting.nightmap_gain, lighting.lightmap_gain, 0.0, 0.0],
+            tune: [
+                lighting.nightmap_gain,
+                lighting.lightmap_gain,
+                lighting.puddle_seed[0],
+                lighting.puddle_seed[1],
+            ],
             trailers: trailer_fog_boxes(lighting.inside, &lighting.puddle_parts, ro),
         };
         self.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cu));
@@ -698,6 +703,13 @@ impl Renderer {
                     || (self.options.omsi_shadow_casters && !inst.omsi_caster)
                 {
                     continue;
+                }
+                // (a stand-in for far tiles casts no shadow where it is not drawn either)
+                if let Some([x0, y0, x1, y1]) = inst.near_only {
+                    let c = camera.position;
+                    if c.x < x0 || c.x > x1 || c.y < y0 || c.y > y1 {
+                        continue;
+                    }
                 }
                 let m = &scene.meshes[inst.mesh];
                 if m.ranges.is_empty() {
@@ -1178,12 +1190,28 @@ impl Renderer {
             );
         }
         let mut prepass_batches: Vec<Batch> = Vec::new();
-        let prepass_job = || -> (Vec<u32>, Vec<Batch>) {
+        // Batches from `prepass_split` on are vehicles drawn in model order, kept out of the
+        // main pass's depth: a wheel hidden by the shadow blob took the ground's place (#292).
+        let mut prepass_split = 0;
+        // (but the vehicle the camera is in: without it the world behind the cabin was shaded)
+        let camera_vehicle = lighting
+            .inside
+            .filter(|v| point_in_vehicle_box(camera.position, v))
+            .map(|(o, _, _)| o);
+        let prepass_job = || -> (Vec<u32>, Vec<Batch>, usize) {
             let mut items: Vec<DrawItem> = Vec::new();
+            let mut ordered_items: Vec<DrawItem> = Vec::new();
             let mut list: Vec<u32> = Vec::new();
             let mut batches: Vec<Batch> = Vec::new();
             for &(i, _, _) in &visible {
                 let inst = &scene.instances[i];
+                let target = if inst.ordered
+                    && camera_vehicle.is_none_or(|o| inst.origin.distance(o) > 0.01)
+                {
+                    &mut ordered_items
+                } else {
+                    &mut items
+                };
                 let cull = culls_back_faces(scene, inst);
                 for (ri, (_, _, slot)) in scene.meshes[inst.mesh].ranges.iter().enumerate() {
                     let mat_id = inst.materials.get(*slot as usize).copied().unwrap_or(0);
@@ -1194,7 +1222,7 @@ impl Renderer {
                     }
                     if let Some(pre_kind) = depth_prepass_kind(kind, mat, inst.presurface) {
                         let (material, look) = depth_only_material(pre_kind, mat_id, mat.look);
-                        items.push(DrawItem {
+                        target.push(DrawItem {
                             pipe: pre_kind * 2 + cull as u8,
                             mesh: inst.mesh as u32,
                             range: ri as u32,
@@ -1206,7 +1234,9 @@ impl Renderer {
                 }
             }
             batch_items(scene, &mut items, true, &mut list, &mut batches);
-            (list, batches)
+            let split = batches.len();
+            batch_items(scene, &mut ordered_items, true, &mut list, &mut batches);
+            (list, batches, split)
         };
         let mut main_batches: Vec<Batch> = Vec::new();
         let mut late_batches: Vec<Batch> = Vec::new();
@@ -1214,7 +1244,7 @@ impl Renderer {
         let has_presurface = visible
             .iter()
             .any(|&(i, _, _)| scene.instances[i].presurface);
-        let mut prepass_found: Option<(Vec<u32>, Vec<Batch>)> = None;
+        let mut prepass_found: Option<(Vec<u32>, Vec<Batch>, usize)> = None;
         let pool = self.encoding_pool.as_deref();
         in_scope(pool, |scope| {
             if prepass_on {
@@ -1222,22 +1252,22 @@ impl Renderer {
                 let slot = &mut prepass_found;
                 scope.spawn(move |_| *slot = Some(job()));
             }
-            let mut by_phase: [Vec<(usize, f32, bool)>; RenderPhase::COUNT] =
+            let own_vehicle =
+                own_vehicle_origins(camera.position, lighting.inside, &lighting.puddle_parts);
+            let mut by_phase: [Vec<(usize, f32, bool)>; OWN_VEHICLE_BUCKET + 1] =
                 std::array::from_fn(|_| Vec::new());
             for &entry in &visible {
-                let phase = effective_render_phase(&scene.instances[entry.0]);
-                by_phase[phase as usize].push(entry);
+                let inst = &scene.instances[entry.0];
+                let bucket = draw_bucket(effective_render_phase(inst), inst.origin, &own_vehicle);
+                by_phase[bucket].push(entry);
             }
-            for phase in RenderPhase::DRAW_ORDER {
-                if phase == RenderPhase::BeforeNormal {
-                    items.clear();
-                    for &(i, _, _) in by_phase[..RenderPhase::BeforeNormal as usize]
-                        .iter()
-                        .flatten()
-                    {
+            // Depth of the fully opaque pixels of ground-phase blends (or only of their walls).
+            let surface_depth_items =
+                |items: &mut Vec<DrawItem>, phases: &[Vec<(usize, f32, bool)>], walls_only: bool| {
+                    for &(i, _, _) in phases.iter().flatten() {
                         let inst = &scene.instances[i];
-                        for (ri, (_, _, slot)) in scene.meshes[inst.mesh].ranges.iter().enumerate()
-                        {
+                        let mesh = &scene.meshes[inst.mesh];
+                        for (ri, (_, _, slot)) in mesh.ranges.iter().enumerate() {
                             let mat_id = inst.materials.get(*slot as usize).copied().unwrap_or(0);
                             let mat = &scene.materials[mat_id];
                             if !surface_depth_coverage(
@@ -1246,6 +1276,7 @@ impl Renderer {
                                 mat.transmap.is_some(),
                                 mat.no_z_check,
                             ) || exclude_texture.is_some_and(|t| mat.uses_texture(t))
+                                || (walls_only && !surface_wall(&mesh.walls, inst.transform, ri))
                             {
                                 continue;
                             }
@@ -1256,16 +1287,26 @@ impl Renderer {
                                     instance_depth_bias(inst, mat),
                                 ),
                                 mesh: inst.mesh as u32,
-                                range: ri as u32,
+                                range: (ri + if walls_only { mesh.ranges.len() } else { 0 })
+                                    as u32,
                                 material: mat_id as u32,
                                 look: mat.look,
                                 entry: inst.base + *slot,
                             });
                         }
                     }
+                };
+            for (phase, bucket) in main_pass_buckets() {
+                if phase == RenderPhase::BeforeNormal {
+                    items.clear();
+                    surface_depth_items(
+                        &mut items,
+                        &by_phase[..RenderPhase::BeforeNormal as usize],
+                        false,
+                    );
                     batch_items(scene, &mut items, true, &mut list, &mut main_batches);
                 }
-                let visible = &by_phase[phase as usize];
+                let visible = &by_phase[bucket];
                 items.clear();
                 let mut blended: Vec<usize> = Vec::new();
                 for &(i, _, _) in visible {
@@ -1418,15 +1459,21 @@ impl Renderer {
                 main_draws[1] += items.len() + late_items.len();
                 batch_items(scene, &mut items, false, &mut list, &mut main_batches);
                 batch_items(scene, &mut late_items, false, &mut list, &mut late_batches);
+                if world_surface_phase(phase) {
+                    items.clear();
+                    surface_depth_items(&mut items, std::slice::from_ref(visible), true);
+                    batch_items(scene, &mut items, true, &mut list, &mut main_batches);
+                }
             }
         });
-        if let Some((pre_list, mut pre_batches)) = prepass_found {
+        if let Some((pre_list, mut pre_batches, split)) = prepass_found {
             let offset = list.len() as u32;
             for b in &mut pre_batches {
                 b.instances = b.instances.start + offset..b.instances.end + offset;
             }
             list.extend(pre_list);
             prepass_batches = pre_batches;
+            prepass_split = split;
         }
         // (the shadow casters' entries after the passes' own: the main pass's batches keep
         // their places in the list while only the shadows change, and its bundles are kept)
@@ -1676,8 +1723,12 @@ impl Renderer {
         }
         drop(spot_pass);
         let single = self.options.msaa <= 1;
-        let share_depth =
-            prepass_on && single && self.ao.is_some() && !has_presurface && !puddles_wanted;
+        let share_depth = prepass_on
+            && single
+            && self.ao.is_some()
+            && !has_presurface
+            && !puddles_wanted
+            && prepass_split == prepass_batches.len();
         // A shared depth gets glass drawn into it, so the glass snapshot reads a copy.
         if glass_on && share_depth {
             self.prepare_glass_depth(width, height);
@@ -1929,7 +1980,7 @@ impl Renderer {
                 encode_batches_filtered(
                     &mut pass,
                     scene,
-                    &prepass_batches,
+                    &prepass_batches[..prepass_split],
                     |batch| batch.pipe / 2 != PIPE_ALPHA_TEST,
                     |pipe| &pipes[pipe as usize],
                 );

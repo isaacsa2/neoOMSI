@@ -41,6 +41,11 @@ fn now_local() -> (i32, i32, i32, i32, i32) {
     (n.year(), n.month() as i32, n.day() as i32, n.hour() as i32, n.minute() as i32)
 }
 
+/// The dropdown row of the item `is` finds in `items`: row 0 is "Auto", the items follow.
+fn auto_row<T>(items: &[T], is: impl Fn(&T) -> bool) -> usize {
+    items.iter().position(is).map_or(0, |i| i + 1)
+}
+
 fn icao_code(text: &str) -> Option<String> {
     let code = text.trim().to_ascii_uppercase();
     (code.len() == 4 && code.chars().all(|c| c.is_ascii_alphanumeric())).then_some(code)
@@ -184,6 +189,7 @@ pub struct Menu {
     pub mini_want: Option<(String, std::time::Instant)>,
     pub mini_failed: Option<String>,
     pub update: crate::updater::Updater,
+    pub content_generation: u64,
 }
 
 fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
@@ -247,6 +253,7 @@ impl Menu {
     }
 
     pub fn new(root: &Path, default_map: &str) -> Menu {
+        let content_generation = ::legacy_config::content_generation();
         let merged = |rel: &str| {
             let mut dirs = ::mods::read_dir_merged(rel);
             if dirs.is_empty() {
@@ -416,7 +423,7 @@ impl Menu {
             time_buf: String::new(),
             weather_top: 0,
             icao: String::new(),
-            metar_live: false,
+            metar_live: true,
             slider: None,
             on_foot: ::config::get_bool("gameplay", "start_on_foot").unwrap_or(false),
             icao_check: None,
@@ -498,9 +505,46 @@ impl Menu {
             mini_want: None,
             mini_failed: None,
             update: Default::default(),
+            content_generation,
         };
         m.veh_open = m.maker_key(m.vehicle);
         m
+    }
+
+    /// Reads the lists again if mods changed since, keeping each pick that is still there.
+    pub fn reload_content(&mut self, root: &Path) {
+        if self.content_generation == ::legacy_config::content_generation() {
+            return;
+        }
+        // (an install that finished outside the Mods page is not mounted yet)
+        let _ = omsi_launcher_lib::register_content();
+        let path_at = |list: &[(String, String)], index: usize| {
+            list.get(index).map(|(_, path)| path.clone()).unwrap_or_default()
+        };
+        let index_of = |list: &[(String, String)], wanted: &str, fallback: usize| {
+            list.iter().position(|(_, path)| path.eq_ignore_ascii_case(wanted)).unwrap_or(fallback)
+        };
+        let map_path = path_at(&self.maps, self.map);
+        let vehicle_path = path_at(&self.vehicles, self.vehicle);
+        let situation_path = path_at(&self.situations, self.situation);
+        let weather_path = path_at(&self.weathers, self.weather);
+        let fresh = Menu::new(root, &map_path);
+        self.map = fresh.map;
+        self.vehicle = index_of(&fresh.vehicles, &vehicle_path, fresh.vehicle);
+        self.situation = index_of(&fresh.situations, &situation_path, 0);
+        self.weather = index_of(&fresh.weathers, &weather_path, 0);
+        if fresh.vehicles.get(self.vehicle).is_none_or(|(_, path)| *path != vehicle_path) {
+            self.opts_for = None;
+        }
+        (self.map_top, self.veh_top) = (0, 0);
+        self.maps = fresh.maps;
+        self.map_entries = fresh.map_entries;
+        self.vehicles = fresh.vehicles;
+        self.vehicle_meta = fresh.vehicle_meta;
+        self.situations = fresh.situations;
+        self.weathers = fresh.weathers;
+        self.content_generation = fresh.content_generation;
+        log::info!("menu: content changed, lists read again");
     }
 
     fn maker_key(&self, i: usize) -> Option<String> {
@@ -632,9 +676,9 @@ impl Menu {
         self.numbers = numbers;
         if self.want_bus.as_ref().is_some_and(|w| w.0.eq_ignore_ascii_case(&bus)) {
             let (_, livery, depot, number, plate) = self.want_bus.take().unwrap_or_default();
-            self.livery = self.liveries.iter().position(|l| *l == livery).unwrap_or(0);
-            self.depot = self.depots.iter().position(|d| d.1.eq_ignore_ascii_case(&depot)).unwrap_or(0);
-            self.number = self.numbers.iter().position(|n| *n == number).unwrap_or(0);
+            self.livery = auto_row(&self.liveries, |l| *l == livery);
+            self.depot = auto_row(&self.depots, |d| d.1.eq_ignore_ascii_case(&depot));
+            self.number = auto_row(&self.numbers, |n| *n == number);
             self.plate = plate;
         }
     }
@@ -649,6 +693,16 @@ impl Menu {
             self.vehicle = i;
             self.veh_open = self.maker_key(i);
             self.want_bus = Some((get("bus"), get("livery"), get("depot"), get("fleet_number"), get("plate")));
+        }
+        if let Some(w) = ::config::get_string("start_menu", "weather") {
+            if let Some(i) = self.weathers.iter().position(|x| x.1.eq_ignore_ascii_case(&w)) {
+                self.weather = i;
+            }
+        }
+        self.metar_live = ::config::get_bool("start_menu", "metar_live").unwrap_or(true);
+        self.icao = get("icao");
+        if let Some(c) = crate::weather_setup::custom_weather(Some(&get("custom_weather"))) {
+            self.custom = c;
         }
     }
 
@@ -668,6 +722,10 @@ impl Menu {
             set("fleet_number", self.number.checked_sub(1).and_then(|i| self.numbers.get(i)).cloned().unwrap_or_default());
             set("plate", self.plate.trim().to_string());
         }
+        set("weather", self.weathers.get(self.weather).map(|w| w.1.clone()).unwrap_or_default());
+        ::config::set_setting("start_menu", "metar_live", self.metar_live);
+        set("icao", self.icao.trim().to_string());
+        set("custom_weather", self.custom.encode());
         if let Err(e) = ::config::save() {
             log::warn!("settings: cannot save: {e}");
         }
@@ -1667,7 +1725,18 @@ impl Menu {
 
 #[cfg(test)]
 mod tests {
-    use super::icao_code;
+    use super::{auto_row, icao_code};
+
+    #[test]
+    fn a_remembered_choice_comes_back_on_its_own_row() {
+        let liveries = ["GPM STIF v1", "GPM STIF v2", "Keolis"].map(String::from);
+        // (what `remember` writes for the row picked: the item before it, "Auto" being row 0)
+        for row in 1..=liveries.len() {
+            let saved = &liveries[row - 1];
+            assert_eq!(auto_row(&liveries, |l| l == saved), row);
+        }
+        assert_eq!(auto_row(&liveries, |l| l.is_empty()), 0);
+    }
 
     #[test]
     fn accepts_four_character_icao_codes_with_digits() {

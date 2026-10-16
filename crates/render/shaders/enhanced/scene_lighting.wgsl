@@ -489,8 +489,11 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         let c = (tk + 0.04 * smoothstep(vec3<f32>(0.0), vec3<f32>(0.08), tk)) * lift * screen_dim;
         return vec4<f32>(c * aer.a + aer.rgb * pre, alpha);
     }
-    let outside = weather_outside_n(in.world, safe_normal(in.normal), terrain, in.params2.w);
-    var n = safe_normal(in.normal);
+    // normals pointing into the mesh: light the side that is seen (#117)
+    let inward = !terrain && (u32(material.params2.w + 0.5) & 8u) != 0u;
+    let in_n = select(1.0, -1.0, inward) * safe_normal(in.normal);
+    let outside = weather_outside_n(in.world, in_n, terrain, in.params2.w);
+    var n = in_n;
     let is_water = material.ambient.w > 1.5;
     if (is_water) {
         n = normalize(n + vec3<f32>(water_ripple(world_pattern_xy(in.world), camera.post.y) * clamp(1.0 - dist / 250.0, 0.2, 1.0), 0.0));
@@ -507,17 +510,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         geo_n = n;
     }
     if (reflective_env && material.bump.y > 0.5) {
-        let slope = bump_offset(duv);
-        let dp1 = dpdx(in.world);
-        let dp2 = dpdy(in.world);
-        let du1 = dpdx(duv);
-        let du2 = dpdy(duv);
-        let dp2p = cross(dp2, n);
-        let dp1p = cross(n, dp1);
-        let t = dp2p * du1.x + dp1p * du2.x;
-        let b = dp2p * du1.y + dp1p * du2.y;
-        let inv = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-12));
-        n = normalize(n - (t * inv * slope.x + b * inv * slope.y) * 0.6);
+        n = bump_normal(n, in.world, duv);
     }
     var albedo = tex.rgb * material.color.rgb;
     var detail_factor = 1.0;
@@ -585,11 +578,11 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     var puddle = 0.0;
     if (wet_road > 0.0) {
         albedo = albedo * mix(1.0, 0.5, wet_road);
-        rough = mix(rough, 0.12, wet_road);
-        f0 = mix(f0, vec3<f32>(0.02), wet_road);
-        let pattern_xy = world_pattern_xy(in.world);
+        rough = mix(rough, max(rough, 0.7), wet_road);
+        f0 = mix(f0, vec3<f32>(0.03), wet_road);
+        let pattern_xy = world_pattern_xy(in.world) + camera.tune.zw;
         let pn = vnoise_f(pattern_xy, 0.22, vec2<f32>(17.3, -9.1)) * 0.65 + vnoise_f(pattern_xy, 0.9, vec2<f32>(-4.0, 8.0)) * 0.35;
-        let puddle_t = 1.0 - wet_road * PUDDLE_SPREAD;
+        let puddle_t = 1.0 - pow(wet_road, 0.6) * PUDDLE_SPREAD;
         puddle = smoothstep(puddle_t - 0.06, puddle_t + 0.06, pn) * smoothstep(0.75, 0.95, n.z);
         if (puddle > 0.001) {
             let raining = enh.weather.z * (1.0 - enh.weather.y);
@@ -601,7 +594,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
                     camera.inside_c.xy, camera.inside_b.yz, fwd, camera.post.y);
             }
             albedo = albedo * (1.0 - 0.68 * puddle) / mix(1.0, detail_factor, puddle * 0.8);
-            rough = clamp(mix(rough, 0.03, puddle) - ripple.z * 0.12, 0.02, 1.0);
+            rough = clamp(mix(rough, 0.06, puddle) - ripple.z * 0.12, 0.02, 1.0);
             f0 = mix(f0, vec3<f32>(enh.debug.y), puddle);
             n = normalize(mix(n, geo_n, puddle) + vec3<f32>(ripple.xy + wake * puddle, 0.0));
         }
@@ -679,26 +672,10 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     let cabin_reflection = select(0.85, 0.0, glass);
     env = mix(env, cab_e * 0.35 / PI, cabin_reflection * cab_view);
     let own_pane = select(0.0, near_player_vehicle(in.world) * inside_vehicle(camera.cam_pos.xyz), glass);
-    if (reflective_env) {
-        let az = atan2(r.y, r.x);
-        var env_uv = vec2<f32>(0.5 + 0.3 * sin(az), 0.5 + 0.45 * clamp(r.z, -1.0, 1.0));
-        if (material.bump.y > 0.5) {
-            env_uv = env_uv + bump_offset(duv);
-        }
-        let photo = textureSampleBias(t_env, s_diffuse, env_uv, max(rough * 16.0, select(2.0, 0.0, glass))).rgb;
-        let photo_avg = textureSampleLevel(t_env, s_diffuse, vec2<f32>(0.5, 0.5), 12.0).rgb;
-        let lum_avg = max(dot(photo_avg, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.02);
-        let ratio = clamp(photo / lum_avg, vec3<f32>(0.35), vec3<f32>(2.0));
-        let band = 1.0 - smoothstep(0.25, 0.7, abs(r.z));
-        let sharpness = 1.0 - smoothstep(0.05, 0.25, rough);
-        let outside_env = 1.0 - cab_view;
-        let clear_air = exp(-enh.fog.x * 150.0);
-        env = env * mix(vec3<f32>(1.0), ratio, band * 0.65 * mix(0.25, 1.0, sharpness) * outside_env * clear_air * enh.debug.z);
-    }
     let spec_occ = clamp(pow(nv + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
     let pbr_reflects = material.pbr.z > 0.5 || material.pbr.w > 0.5;
     let reflects = reflective_env || pbr_reflects || is_water || wet_road > 0.0;
-    var reflection = select(vec3<f32>(0.0), env * env_brdf(f0, rough, nv) * spec_occ * select(1.0, wet_road, !(reflective_env || glass || pbr_reflects || is_water)), reflects);
+    var reflection = select(vec3<f32>(0.0), env * env_brdf(f0, rough, nv) * spec_occ * select(1.0, wet_road * (0.02 + 0.98 * puddle * puddle), !(reflective_env || glass || pbr_reflects || is_water)), reflects);
     if (!reflects) {
         ambient = e_amb * sf.albedo / PI;
     }
@@ -737,8 +714,8 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         let lm_gate = select(1.0, clamp(in.params2.x, 0.0, 1.0), material.params2.x > 0.5);
         emit = emit + tex.rgb * enh.led.x * alpha * lm_gate * max(enh.exposure.z * 2.0, 0.8);
     } else if (material.emissive.w < -0.5) {
-        emit = emit + tex.rgb * 0.2 * enh.led.w * max(enh.exposure.z * 2.0, 0.8);
-    } else if (material.flags.x > 0.5 && material.emissive.w > -0.5 && material.emissive.w < 0.5) {
+        emit = emit + tex.rgb * 0.8 * max(enh.exposure.z * 2.0, 0.8);
+    } else if (material.flags.x > 0.5 && material.flags.x < 1.5 && material.emissive.w > -0.5 && material.emissive.w < 0.5) {
         emit = emit + tex.rgb * 0.2 * max(enh.led.w - 1.0, 0.0) * max(enh.exposure.z * 2.0, 0.8);
     }
     rgb = rgb + emit;

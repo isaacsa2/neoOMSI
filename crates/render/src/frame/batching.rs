@@ -34,7 +34,7 @@ pub(crate) fn batch_items(
         if last.0 != d.look {
             last = (d.look, d.material);
         }
-        let (first, count, _) = scene.meshes[d.mesh as usize].ranges[d.range as usize];
+        let (first, count) = scene.meshes[d.mesh as usize].index_range(d.range);
         out.push(Batch {
             pipe: d.pipe,
             mesh: d.mesh,
@@ -177,6 +177,43 @@ pub(crate) fn effective_render_phase(instance: &Instance) -> RenderPhase {
     }
 }
 
+/// Drawn after every phase: the vehicle the camera sits in, so its windows tint all scenery
+/// behind them (#231).
+pub(crate) const OWN_VEHICLE_BUCKET: usize = RenderPhase::COUNT;
+
+/// Origins of the vehicle the camera sits in and its trailers; empty when the camera is outside.
+pub(crate) fn own_vehicle_origins(
+    camera: DVec3,
+    inside: Option<(DVec3, f64, [f32; 6])>,
+    trailers: &[(DVec3, f64, [f32; 6])],
+) -> Vec<DVec3> {
+    let Some(vehicle) = inside else {
+        return Vec::new();
+    };
+    let parts = || std::iter::once(&vehicle).chain(trailers);
+    if parts().any(|v| point_in_vehicle_box(camera, v)) {
+        parts().map(|v| v.0).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The main pass's buckets in drawing order, with the phase each is drawn as.
+pub(crate) fn main_pass_buckets() -> impl Iterator<Item = (RenderPhase, usize)> {
+    RenderPhase::DRAW_ORDER
+        .map(|phase| (phase, phase as usize))
+        .into_iter()
+        .chain([(RenderPhase::Normal, OWN_VEHICLE_BUCKET)])
+}
+
+pub(crate) fn draw_bucket(phase: RenderPhase, origin: DVec3, own_vehicle: &[DVec3]) -> usize {
+    if own_vehicle.contains(&origin) {
+        OWN_VEHICLE_BUCKET
+    } else {
+        phase as usize
+    }
+}
+
 pub(crate) fn world_surface_phase(phase: RenderPhase) -> bool {
     matches!(
         phase,
@@ -185,6 +222,18 @@ pub(crate) fn world_surface_phase(phase: RenderPhase) -> bool {
             | RenderPhase::Spline
             | RenderPhase::OnSurface
     )
+}
+
+/// Height (m) of a steep face that makes a blended ground-phase slot a wall.
+pub(crate) const SURFACE_WALL_HEIGHT: f32 = 2.0;
+
+/// Whether a range has walls, such as a building carried by a `[rendertype] surface` object
+/// (#444): their depth is written right after its phase, so later ground phases (rails)
+/// stay behind them. `walls`: the mesh's `walls`.
+pub(crate) fn surface_wall(walls: &[WallRange], transform: Mat4, range: usize) -> bool {
+    walls
+        .get(range)
+        .is_some_and(|w| w.count > 0 && w.height * transform.z_axis.z.abs() > SURFACE_WALL_HEIGHT)
 }
 
 pub(crate) fn surface_depth_coverage(

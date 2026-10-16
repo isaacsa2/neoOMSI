@@ -159,7 +159,7 @@ fn trip_routes(
 fn build(map: &str, date: &str) -> Result<Minimap> {
     let t0 = std::time::Instant::now();
     let root = PathBuf::from(lib::load_config().root);
-    let _ = lib::content_dir();
+    let _ = lib::register_content();
     let cfg = ::mods::resolve_path(&root, map);
     let code = ::map::date_code(date).with_context(|| format!("'{date}' is not a date (YYYY-MM-DD)"))?;
     let world = World::open(&root, &cfg, code)?;

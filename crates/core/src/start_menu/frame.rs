@@ -73,6 +73,10 @@ impl App {
     }
 
     pub(crate) fn start_frame(&mut self, event_loop: &ActiveEventLoop, dt: f32) {
+        // (not on the Options page: each change to the order would read every vehicle again)
+        if let Some(m) = self.menu.as_mut().filter(|m| m.page != StartPage::Options) {
+            m.reload_content(&self.args.root);
+        }
         if let Some(m) = self.menu.as_mut().filter(|m| m.page == StartPage::Multiplayer) {
             if m.mp_tab == 1 {
                 for s in &m.servers {
@@ -118,6 +122,9 @@ impl App {
             ctl.set_focus(focused);
             let _ = ctl.poll();
             ctl.actions.clear();
+            if let Some((device, n)) = ctl.pressed.take().filter(|_| self.key_capture.is_some()) {
+                self.capture_button(&device, n);
+            }
         }
         self.start_update_tick();
         self.start_bus_preview(dt);

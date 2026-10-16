@@ -536,17 +536,23 @@ pub(crate) fn data_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".neoomsi"))
 }
 
-fn status_path() -> Option<PathBuf> {
-    let id = ::legacy_config::env::var("OMSI_INSTANCE")
+/// This game's file `~/.neoomsi/<dir>/<instance id or pid>.json`.
+pub(crate) fn instance_file(dir: &str) -> Option<PathBuf> {
+    let id = legacy_config::env::var("OMSI_INSTANCE")
         .ok()
-        .filter(|s| {
-            !s.is_empty()
-                && s.len() <= 64
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        .filter(|instance| {
+            !instance.is_empty()
+                && instance.len() <= 64
+                && instance
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         })
         .unwrap_or_else(|| std::process::id().to_string());
-    Some(data_dir()?.join("lan").join(format!("{id}.json")))
+    Some(data_dir()?.join(dir).join(format!("{id}.json")))
+}
+
+fn status_path() -> Option<PathBuf> {
+    instance_file("lan")
 }
 
 pub struct StatusFileGuard;
@@ -1700,7 +1706,7 @@ pub fn my_pose(
         3
     } else if on("lights_abbl")
         || on("lights_main")
-        || v.var("Spot_Select").is_some_and(|s| s >= 0.0)
+        || v.active_spotlight().is_some()
     {
         // mod buses name their lamps their own way; the selected spotlight is the dipped
         // beam every script sets for the renderer
@@ -2366,7 +2372,8 @@ fn new_remote(
             break;
         };
         match ::simulation::VehicleType::load(&args.root, &path) {
-            Ok(t) => {
+            Ok(mut t) => {
+                t.follow_winding_of(&lead);
                 let t = Arc::new(t);
                 trailer_renders.push(world.add_vehicle_shared(
                     r,

@@ -80,7 +80,8 @@ pub(crate) fn load_coupled_parts(
             break;
         };
         match ::simulation::VehicleType::load(root, &path) {
-            Ok(t) => {
+            Ok(mut t) => {
+                t.follow_winding_of(&lead);
                 let t = Arc::new(t);
                 log::info!(
                     "coupled behind {}: {} ({} meshes{})",
@@ -509,6 +510,7 @@ pub(crate) fn spawn_player(
         rail_bound,
         rail: None,
         head: Vec3::ZERO,
+        head_sim: Vec3::ZERO,
         head_vel: Vec3::ZERO,
         head_omega: Vec3::ZERO,
         steer_look: 0.0,
@@ -811,7 +813,7 @@ fn headlights_off(p: &mut Player) {
         return;
     }
     for _ in 0..4 {
-        if !p.vehicle.var("Spot_Select").is_some_and(|s| s >= 0.0) {
+        if p.vehicle.active_spotlight().is_none() {
             break;
         }
         p.action("kw_scheinwerfer_toggle", true);
