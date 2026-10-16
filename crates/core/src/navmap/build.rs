@@ -256,12 +256,34 @@ pub(super) fn roof_of(tris: &[[Vec3; 3]]) -> Vec<[Vec2; 3]> {
     roof
 }
 
-/// A tree by its name, for one with a mesh rather than a `[tree]` billboard.
-fn tree_named(path: &Path) -> bool {
-    let name = path.to_string_lossy().to_ascii_lowercase();
-    ["baum", "tree", "busch", "bush", "strauch", "linde", "eiche", "kastanie", "birke", "pappel"]
-        .iter()
-        .any(|w| name.contains(w))
+/// A tree by its name, for one with a mesh rather than a `[tree]` billboard: a word of its
+/// file's name, or of the folders it is in under `Sceneryobjects` (else the one it is in),
+/// that names a tree
+pub(super) fn tree_named(path: &Path) -> bool {
+    let words = |s: &str| -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let folders: Vec<String> = path
+        .parent()
+        .map(|p| p.iter().map(|c| c.to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    let folder = match folders.iter().rposition(|c| c.eq_ignore_ascii_case("sceneryobjects")) {
+        Some(k) => folders[k + 1..].join("/"),
+        None => folders.last().cloned().unwrap_or_default(),
+    };
+    let whole = [
+        "tree", "trees", "bush", "bushes", "shrub", "linde", "eiche", "kastanie", "birke",
+        "pappel", "baeume", "bäume", "büsche", "buesche",
+    ];
+    let compound = ["baum", "busch", "strauch"];
+    words(&stem).iter().chain(&words(&folder)).any(|w| {
+        whole.contains(&w.as_str()) || compound.iter().any(|c| w.ends_with(c))
+    })
 }
 
 fn object_floors(

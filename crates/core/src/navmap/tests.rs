@@ -386,3 +386,20 @@ fn roofs_and_crowns_become_buildings_and_a_canopy() {
     assert!(chunk.areas.iter().all(|a| a.level == 0));
 }
 
+#[test]
+fn a_tree_is_known_by_a_word_of_its_name_not_by_letters_anywhere_in_its_path() {
+    let named = |p: &str| tree_named(std::path::Path::new(p));
+    assert!(named("Sceneryobjects/Natur/Strassenbaum_01.sco"));
+    assert!(named("Sceneryobjects/Natur/Linde-gross.sco"));
+    assert!(named("Sceneryobjects/Bäume/Kiefer_02.sco"));
+    assert!(named("Sceneryobjects/Generic/tree_oak.sco"));
+    assert!(named("G:/OMSI 2/Sceneryobjects/Bäume/Laub/Ahorn.sco"));
+    // (not by a folder outside the game's objects)
+    assert!(!named("C:/Users/Baum/OMSI 2/Sceneryobjects/Haeuser/Haus.sco"));
+    // a building under a folder with "tree" in it, a rail switch, a DIY store
+    assert!(!named("Sceneryobjects/StreetObjects/Wohnhaus_3.sco"));
+    assert!(!named("Sceneryobjects/Gleis/Weiche_links.sco"));
+    assert!(!named("Sceneryobjects/Gewerbe/Baumarkt.sco"));
+    assert!(!named("Sceneryobjects/Streets/Haus.sco"));
+}
+
