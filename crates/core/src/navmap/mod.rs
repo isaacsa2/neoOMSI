@@ -57,25 +57,37 @@ impl Surface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Layer {
-    Green = 0,
-    Footway = 1,
-    Track = 2,
+    /// Rivers, canals and lakes: a tile's water where the ground lies below it.
+    Water = 0,
+    Green = 1,
+    /// The crowns of the trees seen from above, over the verges and under every way: as on
+    /// a map, a road or a path through an avenue stays a road or a path.
+    Canopy = 2,
+    Footway = 3,
+    Track = 4,
     /// Carriageways and paved ground together, drawn as carriageway: its outline is the
     /// kerb, and no crack between a road and a yard shows the ground through.
-    Drivable = 3,
+    Drivable = 5,
     /// Paved ground cars use without a path on it, drawn over the carriageway.
-    Paved = 4,
+    Paved = 6,
+    /// The outlines of the buildings seen from above (their roofs), over the ground they
+    /// stand on: the pavement painted on the ground under a house does not cut into it, and
+    /// no house stands on a road.
+    Building = 7,
     /// The paint on the road as the map's textures show it.
-    Marking = 5,
+    Marking = 8,
 }
 
 impl Layer {
-    pub const ALL: [Layer; 6] = [
+    pub const ALL: [Layer; 9] = [
+        Layer::Water,
         Layer::Green,
+        Layer::Canopy,
         Layer::Footway,
         Layer::Track,
         Layer::Drivable,
         Layer::Paved,
+        Layer::Building,
         Layer::Marking,
     ];
 
@@ -87,8 +99,8 @@ impl Layer {
             Layer::Track => s == Surface::Track,
             Layer::Drivable => matches!(s, Surface::Paved | Surface::Road),
             Layer::Paved => s == Surface::Paved,
-            // (read from the textures, not the surfaces)
-            Layer::Marking => false,
+            // (read from the textures, the water, the trees and the roofs, not the surfaces)
+            Layer::Marking | Layer::Water | Layer::Canopy | Layer::Building => false,
         }
     }
 
@@ -97,6 +109,10 @@ impl Layer {
     fn closing(self) -> usize {
         match self {
             Layer::Drivable => 2,
+            // (the crowns of a row of trees grow into one canopy, not a chain of circles; the
+            // water's edge, cut from the ground's 5 m grid, loses its steps)
+            Layer::Canopy => 15,
+            Layer::Water => 3,
             _ => 1,
         }
     }
@@ -108,8 +124,11 @@ impl Layer {
             Layer::Marking => 0.03,
             Layer::Drivable => 0.12,
             Layer::Paved | Layer::Track => 0.2,
+            Layer::Building => 0.25,
             Layer::Footway => 0.3,
             Layer::Green => 0.4,
+            Layer::Canopy => 0.6,
+            Layer::Water => 0.8,
         }
     }
 
@@ -118,6 +137,7 @@ impl Layer {
         match self {
             Layer::Marking => 0.01,
             Layer::Drivable => 1.0,
+            Layer::Building => 6.0,
             _ => 3.0,
         }
     }
@@ -128,6 +148,9 @@ impl Layer {
             Layer::Drivable => Some((0.6, 6.0)),
             Layer::Track => Some((0.8, 20.0)),
             Layer::Green => Some((1.2, 40.0)),
+            Layer::Building => Some((0.8, 20.0)),
+            Layer::Canopy => Some((1.5, 30.0)),
+            Layer::Water => Some((1.5, 40.0)),
             _ => None,
         }
     }
@@ -148,7 +171,8 @@ pub struct Area {
 #[derive(Debug, Clone, Default)]
 pub struct Chunk {
     pub areas: Vec<Area>,
-    /// The same coarsely, for a map seen from far: carriageways, track beds and green only.
+    /// The same coarsely, for a map seen from far: carriageways, track beds, green, buildings
+    /// and trees only.
     pub coarse: Vec<Area>,
 }
 

@@ -167,11 +167,14 @@ fn draw(map: &SurfaceMap, lanes: &[::simulation::traffic::Lane], c: DVec2, radiu
         }
     };
     let colour = |l: Layer| match l {
+        Layer::Water => [40, 62, 96],
         Layer::Green => [38, 58, 40],
         Layer::Footway => [62, 64, 70],
         Layer::Track => [70, 58, 50],
+        Layer::Canopy => [44, 78, 52],
         Layer::Drivable => [120, 122, 132],
         Layer::Paved => [92, 94, 102],
+        Layer::Building => [74, 74, 86],
         Layer::Marking => [225, 225, 230],
     };
     for level in [-1i8, 0, 1] {
@@ -303,3 +306,83 @@ fn a_raised_floor_is_kept_where_paths_run_over_it_and_a_roof_is_not() {
     keep_floors(&mut piece, true, &Evidence::new(&[]));
     assert_eq!(piece.len(), 8);
 }
+
+fn area_of_layer(chunk: &Chunk, layer: Layer) -> f32 {
+    chunk
+        .areas
+        .iter()
+        .filter(|a| a.layer == layer)
+        .map(|a| {
+            a.tris
+                .chunks_exact(3)
+                .map(|t| {
+                    let [p, q, r] = [t[0], t[1], t[2]].map(|k| glam::Vec2::from(a.verts[k as usize]));
+                    (q - p).perp_dot(r - p).abs() * 0.5
+                })
+                .sum::<f32>()
+        })
+        .sum()
+}
+
+#[test]
+fn the_ground_under_a_tiles_water_is_water() {
+    let t = ::map::tile_size() as f32;
+    let flat = ::map::Terrain::flat();
+    let area = |tris: &[[glam::Vec2; 3]]| -> f32 {
+        tris.iter().map(|p| (p[1] - p[0]).perp_dot(p[2] - p[0]).abs() * 0.5).sum()
+    };
+    // over flat ground: all of it, or (the water 5 m down, as a tile without a file has it)
+    // none of it
+    assert!((area(&under_water(&flat, [1.0; 4])) - t * t).abs() < 1.0);
+    assert!(under_water(&flat, [-5.0; 4]).is_empty());
+    // a surface tilted across the tile: the half below it
+    let half = area(&under_water(&flat, [-1.0, 1.0, -1.0, 1.0]));
+    assert!((half - t * t / 2.0).abs() < t, "{half}");
+}
+
+#[test]
+fn a_roof_is_a_building_and_a_lamp_or_a_slab_is_not() {
+    use glam::Vec3;
+    let quad = |x0: f32, y0: f32, x1: f32, y1: f32, z: f32| {
+        [
+            [Vec3::new(x0, y0, z), Vec3::new(x1, y0, z), Vec3::new(x1, y1, z)],
+            [Vec3::new(x0, y0, z), Vec3::new(x1, y1, z), Vec3::new(x0, y1, z)],
+        ]
+    };
+    assert_eq!(roof_of(&quad(0.0, 0.0, 10.0, 8.0, 9.0)).len(), 2, "a house's roof");
+    assert!(roof_of(&quad(-0.4, -0.4, 0.4, 0.4, 6.0)).is_empty(), "a lamp's head");
+    assert!(roof_of(&quad(0.0, 0.0, 20.0, 0.6, 6.0)).is_empty(), "a gantry's beam");
+    assert!(roof_of(&quad(0.0, 0.0, 10.0, 8.0, 0.3)).is_empty(), "a slab on the ground");
+}
+
+#[test]
+fn roofs_and_crowns_become_buildings_and_a_canopy() {
+    let roof = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        [
+            Shape::Roof([[x0, y0], [x1, y0], [x1, y1]]),
+            Shape::Roof([[x0, y0], [x1, y1], [x0, y1]]),
+        ]
+    };
+    let mut shapes: Vec<Shape> = Vec::new();
+    shapes.extend(roof(10.0, 10.0, 20.0, 20.0));
+    // a railing along it, 0.6 m wide: no building
+    shapes.extend(roof(25.0, 10.0, 45.0, 10.6));
+    // a row of trees 5 m apart: one canopy
+    for k in 0..5 {
+        shapes.push(Shape::Crown([10.0 + 5.0 * k as f32, 40.0], 3.0));
+    }
+    // a pond, 40 m by 12 (its corners rounded off by the smoothing of the banks)
+    shapes.push(Shape::Water([[15.0, 48.0], [55.0, 48.0], [55.0, 60.0]]));
+    shapes.push(Shape::Water([[15.0, 48.0], [55.0, 60.0], [15.0, 60.0]]));
+    let mut chunk = Chunk::default();
+    add_shapes(&mut chunk, &shapes);
+    let buildings: Vec<_> = chunk.areas.iter().filter(|a| a.layer == Layer::Building).collect();
+    assert_eq!(buildings.len(), 1, "the house, not the railing");
+    assert!((area_of_layer(&chunk, Layer::Building) - 100.0).abs() < 6.0);
+    assert_eq!(chunk.areas.iter().filter(|a| a.layer == Layer::Canopy).count(), 1);
+    assert!(area_of_layer(&chunk, Layer::Canopy) > 100.0);
+    let water = area_of_layer(&chunk, Layer::Water);
+    assert!(water > 480.0 * 0.85 && water < 485.0, "{water}");
+    assert!(chunk.areas.iter().all(|a| a.level == 0));
+}
+

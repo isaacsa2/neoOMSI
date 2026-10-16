@@ -274,6 +274,13 @@ fn bounds(
     (x0 != usize::MAX).then_some((x0, x1, y0, y1))
 }
 
+/// The mask opened by `r` cells: shrunk and grown again, so what is narrower than `2 r`
+/// cells goes and the rest keeps its shape (the closing of what is not in it).
+pub(crate) fn open(m: &[bool], g: Grid, r: usize) -> Vec<bool> {
+    let inv: Vec<bool> = m.iter().map(|&b| !b).collect();
+    close(&inv, g, r).into_iter().map(|b| !b).collect()
+}
+
 pub(crate) fn close(m: &[bool], g: Grid, r: usize) -> Vec<bool> {
     if r == 0 {
         return m.to_vec();
@@ -505,6 +512,65 @@ pub(crate) fn rings_of(t: &Traced, g: Grid, tol: f32) -> Vec<Ring> {
         } else {
             pts
         };
+        if pts.len() < 3 {
+            continue;
+        }
+        let area = ring_area(&pts);
+        rings.push(Ring {
+            outer: area > 0.0,
+            area: area.abs(),
+            pts,
+        });
+    }
+    rings
+}
+
+/// [`rings_of`] for a natural outline - a river's bank, an avenue's canopy - that the grid
+/// it was cut from left in steps and teeth (the ground's 5 m triangles along a bank): each
+/// ring is walked in steps of a cell, every point moved to the mean of its neighbours
+/// `window` m along either side, and only then simplified. Points on the chunk's border
+/// stay where they are, so the outline goes on in the next chunk without a seam.
+pub(crate) fn rings_smoothed(t: &Traced, g: Grid, window: f32, tol: f32) -> Vec<Ring> {
+    let (n, cell) = (g.n as f32, g.cell as f32);
+    let on_border = |q: [f32; 2]| q[0] == 0.0 || q[1] == 0.0 || q[0] == n || q[1] == n;
+    let mut rings = Vec::new();
+    for corners in &t.corners {
+        // (in cells: the corners every cell apart along the ring)
+        let mut even: Vec<[f32; 2]> = Vec::new();
+        for k in 0..corners.len() {
+            let (a, b) = (corners[k], corners[(k + 1) % corners.len()]);
+            let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+            let steps = len.ceil().max(1.0) as usize;
+            for i in 0..steps {
+                let f = i as f32 / steps as f32;
+                even.push([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]);
+            }
+        }
+        let m = even.len();
+        let reach = ((window / cell) as usize).min(m.saturating_sub(1) / 2);
+        let smooth: Vec<[f32; 2]> = if reach == 0 {
+            even.clone()
+        } else {
+            (0..m)
+                .map(|k| {
+                    if on_border(even[k]) {
+                        return even[k];
+                    }
+                    let mut sum = [0.0f32; 2];
+                    for d in 0..=2 * reach {
+                        let q = even[(k + m + d - reach) % m];
+                        sum[0] += q[0];
+                        sum[1] += q[1];
+                    }
+                    let c = (2 * reach + 1) as f32;
+                    [sum[0] / c, sum[1] / c]
+                })
+                .collect()
+        };
+        let pts: Vec<[f32; 2]> = simplify_ring(&smooth, n, tol / cell)
+            .into_iter()
+            .map(|p| [p[0] * cell, p[1] * cell])
+            .collect();
         if pts.len() < 3 {
             continue;
         }

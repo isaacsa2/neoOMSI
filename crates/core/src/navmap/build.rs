@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use glam::{DVec2, DVec3, Mat4, Vec3};
+use glam::{DVec2, DVec3, Mat4, Vec2, Vec3};
 use hashbrown::HashMap;
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -197,6 +197,71 @@ struct ObjectFloors {
     streets: bool,
     /// `[absolute_height]`: placed at the height the map gives, not on the ground.
     absolute: bool,
+    /// Its roof seen from above, in its own frame: a building's outline (see [`roof_of`]).
+    roof: Vec<[Vec2; 3]>,
+    /// It is a tree: its crown seen from above.
+    crown: Option<Crown>,
+}
+
+/// A tree's crown seen from above.
+#[derive(Clone, Copy)]
+enum Crown {
+    /// A `[tree]` billboard: as wide as its height times its ratio, which the map gives each
+    /// tree (else the middle of the type's ranges: height, ratio).
+    Billboard(f32, f32),
+    /// A tree with a mesh of its own: its radius (m).
+    Mesh(f32),
+}
+
+/// How high above its origin a face of an object must lie to be its roof (m): above a
+/// storey, not a step, a kerb or a bench.
+const ROOF_ABOVE: f32 = 2.5;
+/// A roof is at most this steep (cos of the angle off the vertical): walls are not.
+const ROOF_SLOPE: f32 = 0.3;
+/// The smallest roof that is a building (m²), and how narrow it may be across (m): a lamp's
+/// head, a sign or a gantry over the road are not.
+const ROOF_LEAST: f32 = 8.0;
+const ROOF_NARROW: f32 = 2.0;
+/// Cells by which the roofs are opened: strips narrower than twice that go.
+const ROOF_THIN: usize = 3;
+/// A crown seen from above is a little narrower than its billboard is wide (the leaves
+/// thin out to its edge).
+const CROWN_SHARE: f32 = 0.85;
+
+/// The faces that make an object's roof, seen from above in its own frame: those lying
+/// [`ROOF_ABOVE`] its origin and not upright, if they cover a building's ground. None for a
+/// lamp post, a sign, a gantry - nothing as small or narrow as those.
+pub(super) fn roof_of(tris: &[[Vec3; 3]]) -> Vec<[Vec2; 3]> {
+    let roof: Vec<[Vec2; 3]> = tris
+        .iter()
+        .filter(|p| {
+            let n = (p[1] - p[0]).cross(p[2] - p[0]);
+            let len = n.length();
+            len > 1e-6 && (n.z / len).abs() >= ROOF_SLOPE && (p[0].z + p[1].z + p[2].z) / 3.0 >= ROOF_ABOVE
+        })
+        .map(|p| p.map(|v| v.truncate()))
+        .collect();
+    let area: f32 = roof
+        .iter()
+        .map(|p| (p[1] - p[0]).perp_dot(p[2] - p[0]).abs() * 0.5)
+        .sum();
+    let (lo, hi) = roof.iter().flatten().fold(
+        (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)),
+        |(lo, hi), v| (lo.min(*v), hi.max(*v)),
+    );
+    let size = hi - lo;
+    if area < ROOF_LEAST || size.min_element() < ROOF_NARROW {
+        return Vec::new();
+    }
+    roof
+}
+
+/// A tree by its name, for one with a mesh rather than a `[tree]` billboard.
+fn tree_named(path: &Path) -> bool {
+    let name = path.to_string_lossy().to_ascii_lowercase();
+    ["baum", "tree", "busch", "bush", "strauch", "linde", "eiche", "kastanie", "birke", "pappel"]
+        .iter()
+        .any(|w| name.contains(w))
 }
 
 fn object_floors(
@@ -210,6 +275,19 @@ fn object_floors(
     let sco = ::scenery::SceneryObject::load(&path).ok()?;
     if sco.only_editor {
         return None;
+    }
+    let billboard = sco.tree.as_ref().map(|(_, min_h, max_h, min_r, max_r)| {
+        let mid = |a: f32, b: f32, or: f32| if a + b > 0.0 { (a + b) * 0.5 } else { or };
+        Crown::Billboard(mid(*min_h, *max_h, 10.0), mid(*min_r, *max_r, 1.0))
+    });
+    if billboard.is_some() {
+        return Some(ObjectFloors {
+            faces: Vec::new(),
+            streets: false,
+            absolute: false,
+            roof: Vec::new(),
+            crown: billboard,
+        });
     }
     let sco_dir = path.parent()?.to_path_buf();
     let (model, model_dir) = match &sco.model_file {
@@ -226,6 +304,8 @@ fn object_floors(
     let streets = sco.paths.iter().any(|p| p.kind == 0);
     let dirs = texture_dirs(&world.root, &model_dir);
     let mut faces = Vec::new();
+    // every face, for the roof and a tree's crown
+    let mut all: Vec<[Vec3; 3]> = Vec::new();
     for md in model.lod_meshes(0) {
         let mp = ::mods::resolve_path(&::mods::resolve_path(&model_dir, "model"), &md.file);
         let mp = if ::legacy_config::vfs::is_file(&mp) {
@@ -238,6 +318,13 @@ fn object_floors(
             continue;
         };
         let mesh = ::geometry::mesh_from_o3d(&m);
+        all.extend(mesh.indices.chunks_exact(3).map(|t| {
+            [
+                mesh.positions[t[0] as usize],
+                mesh.positions[t[1] as usize],
+                mesh.positions[t[2] as usize],
+            ]
+        }));
         for &(first, count, slot) in &mesh.ranges {
             let Some(tex) = m.materials.get(slot as usize).map(|t| t.texture.clone()) else {
                 continue;
@@ -263,10 +350,26 @@ fn object_floors(
             }
         }
     }
-    (!faces.is_empty()).then_some(ObjectFloors {
+    // a tree with a mesh: its crown as wide as the mesh; anything else with a roof high
+    // enough is a building - not one that carries a street or is a surface itself
+    let (roof, crown) = if tree_named(&path) {
+        let (lo, hi) = all.iter().flatten().fold(
+            (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)),
+            |(lo, hi), v| (lo.min(v.truncate()), hi.max(v.truncate())),
+        );
+        let r = ((hi - lo).max_element() * 0.5).clamp(0.5, 12.0);
+        (Vec::new(), (!all.is_empty()).then_some(Crown::Mesh(r)))
+    } else if streets || sco.surface {
+        (Vec::new(), None)
+    } else {
+        (roof_of(&all), None)
+    };
+    (!faces.is_empty() || !roof.is_empty() || crown.is_some()).then_some(ObjectFloors {
         faces,
         streets,
         absolute: sco.absolute_height(),
+        roof,
+        crown,
     })
 }
 
@@ -410,6 +513,68 @@ struct Gathered {
     stats: Stats,
     faces: HashMap<(i32, i32), Vec<Face>>,
     paints: Vec<((i32, i32), Paint)>,
+    /// Roofs and tree crowns, by chunk.
+    shapes: HashMap<(i32, i32), Vec<Shape>>,
+}
+
+/// What a chunk shows besides its ground, in metres from the chunk's corner.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Shape {
+    /// A triangle of a building's roof.
+    Roof([[f32; 2]; 3]),
+    /// A tree's crown: its middle and radius.
+    Crown([f32; 2], f32),
+    /// A triangle of ground under a tile's water.
+    Water([[f32; 2]; 3]),
+}
+
+/// The height of a tile's water at `x`, `y` (tile-local m) from its corners (0, 0), (t, 0),
+/// (0, t), (t, t): two triangles, as the game lays the quad (`scene::place_step`).
+fn water_at(h: [f32; 4], x: f32, y: f32) -> f32 {
+    let t = tile_size() as f32;
+    if x + y <= t {
+        h[0] + (h[1] - h[0]) * x / t + (h[2] - h[0]) * y / t
+    } else {
+        h[3] + (h[2] - h[3]) * (t - x) / t + (h[1] - h[3]) * (t - y) / t
+    }
+}
+
+/// The ground under a tile's water (`h`: its corners), as triangles in tile-local metres:
+/// each of the terrain's triangles cut where it rises out of the water.
+pub(super) fn under_water(terrain: &Terrain, h: [f32; 4]) -> Vec<[Vec2; 3]> {
+    let n = terrain.cells;
+    let step = tile_size() as f32 / n as f32;
+    let mut out = Vec::new();
+    let at = |i: usize, j: usize| {
+        let p = Vec2::new(i as f32 * step, j as f32 * step);
+        (p, water_at(h, p.x, p.y) - terrain.height_at(i, j))
+    };
+    for j in 0..n {
+        for i in 0..n {
+            // (split along the diagonal from (i, j) to (i + 1, j + 1), as the ground is drawn)
+            for tri in [
+                [at(i, j), at(i + 1, j), at(i + 1, j + 1)],
+                [at(i, j), at(i + 1, j + 1), at(i, j + 1)],
+            ] {
+                // the part where the water is above the ground (depth > 0)
+                let mut poly: Vec<Vec2> = Vec::with_capacity(4);
+                for k in 0..3 {
+                    let (a, da) = tri[k];
+                    let (b, db) = tri[(k + 1) % 3];
+                    if da > 0.0 {
+                        poly.push(a);
+                    }
+                    if (da > 0.0) != (db > 0.0) {
+                        poly.push(a + (b - a) * (da / (da - db)));
+                    }
+                }
+                for k in 1..poly.len().saturating_sub(1) {
+                    out.push([poly[0], poly[k], poly[k + 1]]);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// How high above the ground an object's floor may lie and still be on the ground (m).
@@ -424,10 +589,11 @@ const DECK: f64 = 1.0;
 /// underpass below it is kept, however deep), or it is a deck that paths run over, and the
 /// floors at its height: a bridge whose road is a spline of its own (Berlin's Schlossbrücke
 /// stood 4 m over the canal's bed and was dropped as a roof - the bridge showed its markings
-/// over nothing). A station's roof high over its platforms stays out.
-pub(super) fn keep_floors(piece: &mut Vec<PieceFace>, streets: bool, ev: &Evidence) {
+/// over nothing). A station's roof high over its platforms stays out. Whether it is such a
+/// deck: then it is no building either.
+pub(super) fn keep_floors(piece: &mut Vec<PieceFace>, streets: bool, ev: &Evidence) -> bool {
     if streets {
-        return;
+        return false;
     }
     let mid = |f: &PieceFace| (f.w[0] + f.w[1] + f.w[2]) / 3.0;
     let decks: Vec<f64> = piece
@@ -436,6 +602,25 @@ pub(super) fn keep_floors(piece: &mut Vec<PieceFace>, streets: bool, ev: &Eviden
         .map(|f| mid(f).z)
         .collect();
     piece.retain(|f| f.above <= RAISED || decks.iter().any(|z| (mid(f).z - z).abs() <= DECK));
+    !decks.is_empty()
+}
+
+/// The radius of a tree's crown (m): a billboard as the map sizes the tree (`extra`: its
+/// texture, height and ratio, as `scene::place` reads them), else the type's own.
+fn crown_radius(c: Crown, extra: &[String]) -> f32 {
+    match c {
+        Crown::Billboard(h, r) => {
+            let num = |k: usize, or: f32| {
+                extra
+                    .get(k)
+                    .map(|s| ::legacy_config::parse_f64(s) as f32)
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(or)
+            };
+            (num(1, h) * num(2, r) * 0.5 * CROWN_SHARE).clamp(0.5, 12.0)
+        }
+        Crown::Mesh(r) => r,
+    }
 }
 
 /// A face of a piece (a spline, an object) on its way into [`Gathered`]: its corners, texture
@@ -469,6 +654,45 @@ pub(super) fn piece_level(faces: &[PieceFace]) -> i8 {
 }
 
 impl Gathered {
+    /// File a shape covering `lo`..`hi` (world) under every chunk it reaches, in its frame.
+    fn add_shape(&mut self, lo: DVec2, hi: DVec2, shape: impl Fn(DVec2) -> Shape) {
+        let m = MARGIN as f64 * CELL;
+        let (x0, y0) = SurfaceMap::chunk_key(lo - DVec2::splat(m));
+        let (x1, y1) = SurfaceMap::chunk_key(hi + DVec2::splat(m));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let o = SurfaceMap::chunk_origin((x, y));
+                self.shapes.entry((x, y)).or_default().push(shape(o));
+            }
+        }
+    }
+
+    /// An object's roof placed at `pos`, turned by `rot` (see [`roof_of`]).
+    fn add_roof(&mut self, roof: &[[Vec2; 3]], pos: DVec3, rot: &Mat4) {
+        for t in roof {
+            let w = t.map(|v| pos.truncate() + rot.transform_vector3(v.extend(0.0)).truncate().as_dvec2());
+            let lo = w[0].min(w[1]).min(w[2]);
+            let hi = w[0].max(w[1]).max(w[2]);
+            self.add_shape(lo, hi, |o| Shape::Roof(w.map(|p| (p - o).as_vec2().to_array())));
+        }
+    }
+
+    /// The ground under a tile's water, from the tile's corner `origin` (see [`under_water`]).
+    fn add_water(&mut self, tris: &[[Vec2; 3]], origin: DVec2) {
+        for t in tris {
+            let w = t.map(|v| origin + v.as_dvec2());
+            let lo = w[0].min(w[1]).min(w[2]);
+            let hi = w[0].max(w[1]).max(w[2]);
+            self.add_shape(lo, hi, |o| Shape::Water(w.map(|p| (p - o).as_vec2().to_array())));
+        }
+    }
+
+    /// A tree's crown of radius `r` at `at`.
+    fn add_crown(&mut self, at: DVec2, r: f32) {
+        let d = DVec2::splat(r as f64);
+        self.add_shape(at - d, at + d, |o| Shape::Crown((at - o).as_vec2().to_array(), r));
+    }
+
     /// Add the faces of one piece - a spline, an object - all on one level: how high the
     /// piece lies above the ground over all its faces. Taken face by face, a bridge deck some
     /// 4 m over a canal's bed (Berlin's Schlossbrücke) fell to either side of `LEVEL_GAP`
@@ -728,6 +952,7 @@ pub fn build_surface_stream(
                 stats: HashMap::new(),
                 faces: HashMap::new(),
                 paints: Vec::new(),
+                shapes: HashMap::new(),
             };
             deps.add(path);
             deps.add(&tile_companion(path, ".terrain"));
@@ -750,6 +975,21 @@ pub fn build_surface_stream(
             };
             let origin2 = DVec2::new(*tx as f64 * ts, *ty as f64 * ts);
             let origin = origin2.extend(0.0);
+            // the tile's water where the ground lies below it: its corners start at -5 m and
+            // take the file's heights only when it gives one set (as `scene::stage` reads it)
+            let water_file = std::path::PathBuf::from(format!("{}.water", path.display()));
+            deps.add(&water_file);
+            if tile.has_water {
+                let h = ::legacy_config::vfs::read(&water_file)
+                    .ok()
+                    .map(|b| ::map::terrain::Water::parse(&b))
+                    .filter(|w| w.count == 1 && w.values.len() >= 4)
+                    .map(|w| [w.values[0], w.values[1], w.values[2], w.values[3]])
+                    .unwrap_or([-5.0; 4]);
+                if let Some(t) = terrains.get(&(*tx, *ty)) {
+                    g.add_water(&under_water(t, h), origin2);
+                }
+            }
             // the ground painted with asphalt, cobbles, pavement or ballast
             let paint_dirs = [world.map_dir.clone(), world.root.clone()];
             for (layer, img) in world.load_ground_paint(path) {
@@ -881,8 +1121,14 @@ pub fn build_surface_stream(
                         above: mid.z - under,
                     });
                 }
-                keep_floors(&mut piece, floors.streets, &ev);
+                let deck = keep_floors(&mut piece, floors.streets, &ev);
                 g.add_piece(&mut piece, &ev);
+                if !deck && !floors.roof.is_empty() {
+                    g.add_roof(&floors.roof, pos, &rot);
+                }
+                if let Some(c) = floors.crown {
+                    g.add_crown(pos.truncate(), crown_radius(c, &o.extra));
+                }
             }
             // the rows hung on splines: arrows on the road, parking bays, kerb pieces
             for a in &tile.spline_attachments {
@@ -913,6 +1159,10 @@ pub fn build_surface_stream(
                     }
                     keep_floors(&mut piece, floors.streets, &ev);
                     g.add_piece(&mut piece, &ev);
+                    // (a row of trees along a road: each the middle of its type's ranges)
+                    if let Some(c) = floors.crown {
+                        g.add_crown(pos.truncate(), crown_radius(c, &[]));
+                    }
                 }
             }
             g
@@ -920,6 +1170,7 @@ pub fn build_surface_stream(
         .collect();
     let mut stats: Stats = HashMap::new();
     let mut faces: HashMap<(i32, i32), Vec<Face>> = HashMap::new();
+    let mut shapes: HashMap<(i32, i32), Vec<Shape>> = HashMap::new();
     let mut paints: HashMap<(i32, i32), Vec<Paint>> = HashMap::new();
     for g in parts {
         for (k, p) in g.paints {
@@ -933,6 +1184,9 @@ pub fn build_surface_stream(
         }
         for (k, mut v) in g.faces {
             faces.entry(k).or_default().append(&mut v);
+        }
+        for (k, mut v) in g.shapes {
+            shapes.entry(k).or_default().append(&mut v);
         }
     }
     let (names, sources, textures) = materials.into_inner().settle();
@@ -1036,6 +1290,9 @@ pub fn build_surface_stream(
         class: &class,
         ground: &ground,
     };
+    for k in shapes.keys() {
+        faces.entry(*k).or_default();
+    }
     let mut todo: Vec<((i32, i32), Vec<Face>)> = faces.into_iter().collect();
     let dist = |k: (i32, i32)| {
         (SurfaceMap::chunk_origin(k) + DVec2::splat(CHUNK * 0.5) - centre).length_squared()
@@ -1048,7 +1305,8 @@ pub fn build_surface_stream(
         let part: Vec<((i32, i32), Arc<Chunk>)> = todo[done..end]
             .par_iter()
             .filter_map(|(k, faces)| {
-                let ch = build_chunk(*k, faces, &class, &paint_masks, &painted);
+                let here = shapes.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
+                let ch = build_chunk(*k, faces, here, &class, &paint_masks, &painted);
                 (!ch.areas.is_empty()).then(|| (*k, Arc::new(ch)))
             })
             .collect();
@@ -1158,6 +1416,7 @@ impl Edges {
 fn build_chunk(
     key: (i32, i32),
     faces: &[Face],
+    shapes: &[Shape],
     class: &[u8],
     paint: &[Option<Arc<raster::PaintMask>>],
     painted: &PaintedGround,
@@ -1263,8 +1522,78 @@ fn build_chunk(
             }
         }
     }
+    add_shapes(&mut chunk, shapes);
     chunk
 }
+
+/// The buildings and the trees of a chunk from its roofs and crowns: each shape filled into
+/// the chunk's grid, the union traced into outlines - one simple block for a building of a
+/// hundred roof faces, one canopy for an avenue of trees.
+pub(super) fn add_shapes(chunk: &mut Chunk, shapes: &[Shape]) {
+    if shapes.is_empty() {
+        return;
+    }
+    let g = raster::COARSE;
+    let w = g.w();
+    let to_cells = |p: [f32; 2]| [p[0] / CELL as f32 + MARGIN as f32, p[1] / CELL as f32 + MARGIN as f32, 0.0];
+    let mut roofs: Option<Raster> = None;
+    let mut water: Option<Raster> = None;
+    let mut crowns: Option<Vec<bool>> = None;
+    for s in shapes {
+        match *s {
+            Shape::Roof(t) => roofs
+                .get_or_insert_with(|| Raster::new(g))
+                .fill_tri(t.map(to_cells), 1, None),
+            Shape::Water(t) => water
+                .get_or_insert_with(|| Raster::new(g))
+                .fill_tri(t.map(to_cells), 1, None),
+            Shape::Crown(c, r) => {
+                let m = crowns.get_or_insert_with(|| vec![false; w * w]);
+                let [cx, cy, _] = to_cells(c);
+                let rc = r / CELL as f32;
+                let (j0, j1) = ((cy - rc).floor().max(0.0) as usize, ((cy + rc).ceil() as usize).min(w));
+                let (i0, i1) = ((cx - rc).floor().max(0.0) as usize, ((cx + rc).ceil() as usize).min(w));
+                for j in j0..j1 {
+                    for i in i0..i1 {
+                        let (dx, dy) = (i as f32 + 0.5 - cx, j as f32 + 0.5 - cy);
+                        if dx * dx + dy * dy <= rc * rc {
+                            m[j * w + i] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let filled = |r: Raster| r.class.iter().map(|&c| c != 0).collect::<Vec<bool>>();
+    let masks = [
+        (Layer::Water, water.map(filled)),
+        // (a railing, a fence or a lamp's arm along a roof is no building: what is narrower
+        // than some 1.2 m is opened away)
+        (Layer::Building, roofs.map(filled).map(|m| raster::open(&m, g, ROOF_THIN))),
+        (Layer::Canopy, crowns),
+    ];
+    for (layer, mask) in masks {
+        let Some(mask) = mask else { continue };
+        let mask = raster::close(&mask, g, layer.closing());
+        let t = raster::traced(&mask, g, None);
+        // (a bank and a canopy are drawn soft, a building's walls straight)
+        let rings_of = |tol: f32| match layer {
+            Layer::Water => raster::rings_smoothed(&t, g, WATER_SMOOTH, tol),
+            Layer::Canopy => raster::rings_smoothed(&t, g, CANOPY_SMOOTH, tol),
+            _ => raster::rings_of(&t, g, tol),
+        };
+        chunk.areas.extend(areas_of(rings_of(layer.tolerance()), layer, 0, layer.least()));
+        if let Some((tol, least)) = layer.coarse() {
+            chunk.coarse.extend(areas_of(rings_of(tol), layer, 0, least));
+        }
+    }
+}
+
+/// How far along a river's bank (m) its outline is evened out: further than the ground's
+/// 5 m triangles it was cut from, so their teeth go.
+const WATER_SMOOTH: f32 = 6.0;
+/// The same for the trees' canopy: the dents between the crowns of a row.
+const CANOPY_SMOOTH: f32 = 3.0;
 
 fn point_in_ring(p: [f32; 2], ring: &[[f32; 2]]) -> bool {
     let mut inside = false;

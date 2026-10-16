@@ -16,6 +16,16 @@ pub(super) const FOOTWAY: Color = Color::rgba(29, 29, 33, 1.0);
 pub(super) const TRACK_BED: Color = Color::rgba(35, 32, 31, 1.0);
 pub(super) const CARRIAGEWAY: Color = Color::rgba(76, 76, 86, 1.0);
 pub(super) const PAVED: Color = Color::rgba(60, 60, 69, 1.0);
+/// Rivers and lakes: a deep blue, darker than anything that can be driven on.
+pub(super) const WATER: Color = Color::rgba(22, 34, 52, 1.0);
+/// The trees' crowns: a shade greener than the verges, to know a park or an avenue by, and
+/// their rim darker, for a little depth.
+pub(super) const CANOPY: Color = Color::rgba(34, 54, 40, 1.0);
+pub(super) const CANOPY_EDGE: Color = Color::rgba(26, 40, 31, 1.0);
+/// The buildings: blocks a little lighter than the ground around them, with a fine outline,
+/// to know a place by - not as light as the road, which stays what the eye follows.
+pub(super) const BUILDING: Color = Color::rgba(44, 44, 52, 1.0);
+pub(super) const BUILDING_EDGE: Color = Color::rgba(58, 58, 68, 1.0);
 pub(super) const KERB: Color = Color::rgba(86, 86, 97, 1.0);
 /// The paint on the road: lines, arrows, stop lines and crossings as the map paints them.
 pub(super) const MARK: Color = Color::rgba(168, 168, 178, 0.8);
@@ -25,11 +35,14 @@ pub(super) const RAIL: Color = Color::rgba(112, 100, 92, 1.0);
 
 fn fill(l: Layer) -> Color {
     match l {
+        Layer::Water => WATER,
         Layer::Green => GREEN,
         Layer::Footway => FOOTWAY,
         Layer::Track => TRACK_BED,
+        Layer::Canopy => CANOPY,
         Layer::Drivable => CARRIAGEWAY,
         Layer::Paved => PAVED,
+        Layer::Building => BUILDING,
         Layer::Marking => MARK,
     }
 }
@@ -82,6 +95,26 @@ pub(super) fn build_surfaces(
                 {
                     let c = if level < 0 { fill(layer).alpha(0.45) } else { fill(layer) };
                     p.world_tris(&pts_of(o, a), &a.tris, c);
+                }
+            }
+            if layer == Layer::Canopy && kerb_px > 0.0 {
+                for (k, ch) in &chunks {
+                    let o = SurfaceMap::chunk_origin(*k);
+                    for a in areas(ch, coarse).iter().filter(|a| a.level == level && a.layer == layer) {
+                        for e in &a.edges {
+                            p.ribbon(&edge_of(o, e), 0.6, kerb_px * 1.5, CANOPY_EDGE, false);
+                        }
+                    }
+                }
+            }
+            if layer == Layer::Building && kerb_px > 0.0 {
+                for (k, ch) in &chunks {
+                    let o = SurfaceMap::chunk_origin(*k);
+                    for a in areas(ch, coarse).iter().filter(|a| a.level == level && a.layer == layer) {
+                        for e in &a.edges {
+                            p.ribbon(&edge_of(o, e), 0.1, kerb_px, BUILDING_EDGE, false);
+                        }
+                    }
                 }
             }
             if layer == Layer::Drivable && kerb_px > 0.0 {
